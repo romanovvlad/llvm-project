@@ -2490,9 +2490,33 @@ bool RewriteMFMAFormStage::initHeuristics(
         // Have to get src types separately since subregs may cause C and D
         // registers to be different types even though the actual operand is
         // the same size.
-        const TargetRegisterClass *VUseRC = DAG.MRI.getRegClass(Src2->getReg());
-        const TargetRegisterClass *AUseRC = SRI->getEquivalentAGPRClass(VUseRC);
-        DAG.MRI.setRegClass(Src2->getReg(), AUseRC);
+        // Only reclassify to AGPR if all defining instructions can produce
+        // AGPR output. Non-MAI instructions (e.g. V_ADD_U32) can only write
+        // VGPRs and must not have their output reclassed to AGPR.
+        bool AllDefsCanProduceAGPR = true;
+        for (MachineInstr &DefMI :
+             DAG.MRI.def_instructions(Src2->getReg())) {
+          if (TII->isMAI(DefMI) || DefMI.isCopy() || DefMI.isImplicitDef())
+            continue;
+          unsigned DefOpIdx =
+              DefMI.findRegisterDefOperandIdx(Src2->getReg(), /*TRI=*/nullptr);
+          if (DefOpIdx == ~0u)
+            continue;
+          const TargetRegisterClass *DefOpRC =
+              TII->getRegClass(DefMI.getDesc(), DefOpIdx);
+          if (DefOpRC && !SRI->isAGPRClass(DefOpRC) &&
+              !SRI->isVectorSuperClass(DefOpRC)) {
+            AllDefsCanProduceAGPR = false;
+            break;
+          }
+        }
+        if (AllDefsCanProduceAGPR) {
+          const TargetRegisterClass *VUseRC =
+              DAG.MRI.getRegClass(Src2->getReg());
+          const TargetRegisterClass *AUseRC =
+              SRI->getEquivalentAGPRClass(VUseRC);
+          DAG.MRI.setRegClass(Src2->getReg(), AUseRC);
+        }
       }
       Changed = true;
     }
@@ -2975,6 +2999,29 @@ bool RewriteMFMAFormStage::rewrite(
     auto RI = RedefMap.find(RewriteReg);
     if (RI != RedefMap.end())
       RegToRewrite = RI->second;
+
+    // Check if all defs of this register can produce AGPR. If any def
+    // is a non-MAI instruction (e.g. V_ADD_U32), it can only write VGPRs
+    // and must not have its output reclassed to AGPR.
+    bool CanReclass = true;
+    for (MachineInstr &DefMI :
+         DAG.MRI.def_instructions(RegToRewrite)) {
+      if (TII->isMAI(DefMI) || DefMI.isCopy() || DefMI.isImplicitDef())
+        continue;
+      unsigned DefOpIdx =
+          DefMI.findRegisterDefOperandIdx(RegToRewrite, /*TRI=*/nullptr);
+      if (DefOpIdx == ~0u)
+        continue;
+      const TargetRegisterClass *DefOpRC =
+          TII->getRegClass(DefMI.getDesc(), DefOpIdx);
+      if (DefOpRC && !SRI->isAGPRClass(DefOpRC) &&
+          !SRI->isVectorSuperClass(DefOpRC)) {
+        CanReclass = false;
+        break;
+      }
+    }
+    if (!CanReclass)
+      continue;
 
     const TargetRegisterClass *CurrRC = DAG.MRI.getRegClass(RegToRewrite);
     const TargetRegisterClass *AGPRRC = SRI->getEquivalentAGPRClass(CurrRC);

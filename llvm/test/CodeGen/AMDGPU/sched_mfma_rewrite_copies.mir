@@ -4952,7 +4952,7 @@ body:             |
   ; CHECK-NEXT:   [[DEF18:%[0-9]+]]:areg_128_align2 = IMPLICIT_DEF
   ; CHECK-NEXT:   [[DEF19:%[0-9]+]]:areg_128_align2 = IMPLICIT_DEF
   ; CHECK-NEXT:   [[COPY:%[0-9]+]]:areg_128_align2 = COPY [[V_ADD_U32_e32_]]
-  ; CHECK-NEXT:   undef [[V_ADD_U32_e32_1:%[0-9]+]].sub0:areg_128_align2 = V_ADD_U32_e32 [[DEF16]].sub1, [[DEF15]], implicit $exec
+  ; CHECK-NEXT:   undef [[V_ADD_U32_e32_1:%[0-9]+]].sub0:vreg_128_align2 = V_ADD_U32_e32 [[DEF16]].sub1, [[DEF15]], implicit $exec
   ; CHECK-NEXT:   $scc = IMPLICIT_DEF
   ; CHECK-NEXT:   S_CBRANCH_SCC1 %bb.3, implicit killed $scc
   ; CHECK-NEXT: {{  $}}
@@ -4962,7 +4962,7 @@ body:             |
   ; CHECK-NEXT:   [[DEF17:%[0-9]+]]:areg_128_align2 = contract nofpexcept V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64 [[DEF11]], [[DEF12]], [[COPY]], 4, 4, [[DEF14]].sub0, [[DEF15]], 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[DEF18:%[0-9]+]]:areg_128_align2 = contract nofpexcept V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64 [[DEF11]], [[DEF12]], [[DEF17]], 4, 4, [[DEF14]].sub0, [[DEF15]], 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[DEF19:%[0-9]+]]:areg_128_align2 = contract nofpexcept V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64 [[DEF11]], [[DEF12]], [[DEF18]], 4, 4, [[DEF14]].sub0, [[DEF15]], 0, 0, implicit $mode, implicit $exec
-  ; CHECK-NEXT:   [[V_ADD_U32_e32_1:%[0-9]+]]:areg_128_align2 = contract nofpexcept V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64 [[DEF11]], [[DEF12]], [[DEF19]], 4, 4, [[DEF14]].sub0, [[DEF15]], 0, 0, implicit $mode, implicit $exec
+  ; CHECK-NEXT:   [[V_ADD_U32_e32_1:%[0-9]+]]:vreg_128_align2 = contract nofpexcept V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64 [[DEF11]], [[DEF12]], [[DEF19]], 4, 4, [[DEF14]].sub0, [[DEF15]], 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64_:%[0-9]+]]:areg_128_align2 = contract nofpexcept V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64 [[DEF11]], [[DEF12]], [[DEF19]], 4, 4, [[DEF14]].sub0, [[DEF15]], 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64_1:%[0-9]+]]:areg_128_align2 = contract nofpexcept V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64 [[DEF11]], [[DEF12]], [[DEF19]], 4, 4, [[DEF14]].sub0, [[DEF15]], 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64_2:%[0-9]+]]:areg_128_align2 = contract nofpexcept V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64 [[DEF11]], [[DEF12]], [[DEF19]], 4, 4, [[DEF14]].sub0, [[DEF15]], 0, 0, implicit $mode, implicit $exec
@@ -5367,6 +5367,14 @@ body:             |
   ; CHECK-NEXT:   [[DEF13:%[0-9]+]]:vreg_128_align2 = IMPLICIT_DEF
   ; CHECK-NEXT:   [[DEF14:%[0-9]+]]:vreg_64_align2 = IMPLICIT_DEF
   ; CHECK-NEXT:   [[DEF15:%[0-9]+]]:vgpr_32 = IMPLICIT_DEF
+  ; CHECK-NEXT:   undef [[AV_MOV_:%[0-9]+]].sub0:areg_128_align2 = AV_MOV_B32_IMM_PSEUDO 0, implicit $exec
+  ; CHECK-NEXT:   [[AV_MOV_:%[0-9]+]].sub1:areg_128_align2 = AV_MOV_B32_IMM_PSEUDO 0, implicit $exec
+  ; CHECK-NEXT:   [[AV_MOV_:%[0-9]+]].sub2:areg_128_align2 = AV_MOV_B32_IMM_PSEUDO 0, implicit $exec
+  ; CHECK-NEXT:   [[AV_MOV_:%[0-9]+]].sub3:areg_128_align2 = AV_MOV_B32_IMM_PSEUDO 0, implicit $exec
+  ; CHECK-NEXT: {{  $}}
+  ; CHECK-NEXT: bb.1:
+  ; CHECK-NEXT:   successors: %bb.2(0x80000000)
+  ; CHECK-NEXT: {{  $}}
   ; CHECK-NEXT:   [[V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64_:%[0-9]+]]:areg_128_align2 = contract nofpexcept V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64 [[DEF11]], [[DEF12]], [[AV_MOV_]], 4, 4, [[DEF14]].sub0, [[DEF15]], 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64_1:%[0-9]+]]:areg_128_align2 = contract nofpexcept V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64 [[DEF11]], [[DEF12]], [[V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64_]], 4, 4, [[DEF14]].sub0, [[DEF15]], 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64_2:%[0-9]+]]:areg_128_align2 = contract nofpexcept V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64 [[DEF11]], [[DEF12]], [[V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64_1]], 4, 4, [[DEF14]].sub0, [[DEF15]], 0, 0, implicit $mode, implicit $exec
@@ -5460,6 +5468,12 @@ body:             |
   ; CHECK-NEXT:   [[DEF13:%[0-9]+]]:vreg_128_align2 = IMPLICIT_DEF
   ; CHECK-NEXT:   [[DEF14:%[0-9]+]]:vreg_64_align2 = IMPLICIT_DEF
   ; CHECK-NEXT:   [[DEF15:%[0-9]+]]:vgpr_32 = IMPLICIT_DEF
+  ; CHECK-NEXT:   undef [[AV_MOV_:%[0-9]+]].sub0_sub1:areg_128_align2 = AV_MOV_B64_IMM_PSEUDO 0, implicit $exec
+  ; CHECK-NEXT:   [[AV_MOV_:%[0-9]+]].sub2_sub3:areg_128_align2 = AV_MOV_B64_IMM_PSEUDO 0, implicit $exec
+  ; CHECK-NEXT: {{  $}}
+  ; CHECK-NEXT: bb.1:
+  ; CHECK-NEXT:   successors: %bb.2(0x80000000)
+  ; CHECK-NEXT: {{  $}}
   ; CHECK-NEXT:   [[V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64_:%[0-9]+]]:areg_128_align2 = contract nofpexcept V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64 [[DEF11]], [[DEF12]], [[AV_MOV_]], 4, 4, [[DEF14]].sub0, [[DEF15]], 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64_1:%[0-9]+]]:areg_128_align2 = contract nofpexcept V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64 [[DEF11]], [[DEF12]], [[V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64_]], 4, 4, [[DEF14]].sub0, [[DEF15]], 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64_2:%[0-9]+]]:areg_128_align2 = contract nofpexcept V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64 [[DEF11]], [[DEF12]], [[V_MFMA_SCALE_F32_16X16X128_F8F6F4_f4_f4_e64_1]], 4, 4, [[DEF14]].sub0, [[DEF15]], 0, 0, implicit $mode, implicit $exec
