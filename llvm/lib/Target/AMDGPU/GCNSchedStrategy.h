@@ -492,6 +492,15 @@ private:
   bool hasUseRequiringVGPR(ArrayRef<SlotIndex> Src2ReachingDefs,
                            const SmallPtrSetImpl<MachineInstr *> &RewriteSet);
 
+  /// \returns true if any def of \p Reg can't produce AGPR output.
+  /// MFMAs with an AGPR-form variant (per isRewriteCandidate) are assumed to
+  /// produce AGPR after rewrite, regardless of current RewriteSet membership.
+  bool hasDefRequiringVGPR(Register Reg);
+
+  /// \returns true if operand \p OpIdx of \p MI accepts an AGPR-class register.
+  /// Conservative for INLINEASM (always returns false) and implicit operands.
+  bool operandAcceptsAGPR(const MachineInstr &MI, unsigned OpIdx) const;
+
 public:
   bool initGCNSchedStage() override;
 

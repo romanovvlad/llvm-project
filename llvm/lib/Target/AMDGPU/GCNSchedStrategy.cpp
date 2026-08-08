@@ -1406,12 +1406,14 @@ bool RewriteMFMAFormStage::initGCNSchedStage() {
   if (!initHeuristics(RewriteCands, CopyForUse, CopyForDef))
     return false;
 
-  int64_t Cost = getRewriteCost(RewriteCands, CopyForUse, CopyForDef);
+  // TODO: restore cost heuristic once the cost model accounts for all copies.
+  // int64_t Cost = getRewriteCost(RewriteCands, CopyForUse, CopyForDef);
+  // if (Cost > 0)
+  //   return false;
 
-  // If we haven't found the beneficial conditions, prefer the VGPR form which
-  // may result in less cross RC copies.
-  if (Cost > 0)
-    return false;
+  // initHeuristics left the MFMAs in AGPR form for RP measurement.
+  // Reset them before rewrite() which re-applies the transformation.
+  resetRewriteCandsToVGPR(RewriteCands);
 
   return rewrite(RewriteCands);
 }
@@ -2312,18 +2314,20 @@ void GCNSchedStage::modifyRegionSchedule(unsigned RegionIdx,
 }
 
 /// Returns true if reaching def \p RD will be in AGPR form after the rewrite
-/// and so needs no bridge copy: a candidate MFMA in \p RewriteSet, an
-/// AV_MOV_*_IMM_PSEUDO, or a copy from a candidate src2 reg in \p CandSrc2Regs.
-/// A non-candidate MFMA stays in VGPR form and still needs a bridge.
+/// and so needs no bridge copy.
 static bool isReachingDefAGPRForm(
     MachineInstr *RD, const SmallPtrSetImpl<MachineInstr *> &RewriteSet,
     const DenseSet<Register> &CandSrc2Regs, const SIInstrInfo &TII) {
   if (TII.isMAI(*RD))
     return RewriteSet.contains(RD);
-  if (RD->getOpcode() == AMDGPU::AV_MOV_B32_IMM_PSEUDO ||
-      RD->getOpcode() == AMDGPU::AV_MOV_B64_IMM_PSEUDO)
-    return true;
   if (RD->isCopy() && CandSrc2Regs.contains(RD->getOperand(1).getReg()))
+    return true;
+  // Instructions whose def operand accepts AGPR (DS_READ, AV_MOV, etc.)
+  // will produce AGPR after reclassification -- no bridge copy needed.
+  const SIRegisterInfo &SRI = static_cast<const SIRegisterInfo &>(
+      TII.getRegisterInfo());
+  const TargetRegisterClass *DefRC = TII.getRegClass(RD->getDesc(), 0);
+  if (DefRC && (SRI.isAGPRClass(DefRC) || SRI.isVectorSuperClass(DefRC)))
     return true;
   return false;
 }
@@ -2331,40 +2335,118 @@ static bool isReachingDefAGPRForm(
 bool RewriteMFMAFormStage::hasUseRequiringVGPR(
     ArrayRef<SlotIndex> Src2ReachingDefs,
     const SmallPtrSetImpl<MachineInstr *> &RewriteSet) {
+  LLVM_DEBUG(dbgs() << "  [hasUseRequiringVGPR] " << Src2ReachingDefs.size()
+                    << " reaching defs\n");
   for (SlotIndex RDIdx : Src2ReachingDefs) {
     const MachineInstr *RD = DAG.LIS->getInstructionFromIndex(RDIdx);
     SmallVector<MachineOperand *, 8> ReachingUses;
     findReachingUses(RD, DAG.LIS, ReachingUses);
+    LLVM_DEBUG(dbgs() << "    RD: " << *RD << "      " << ReachingUses.size()
+                      << " reaching uses\n");
     for (const MachineOperand *UseMO : ReachingUses) {
       const MachineInstr *UseMI = UseMO->getParent();
-      if (UseMI->isCopy())
+      LLVM_DEBUG(dbgs() << "      use: " << *UseMI);
+      if (UseMI->isCopy()) {
+        LLVM_DEBUG(dbgs() << "        -> skip (copy)\n");
         continue;
-      if (TII->isMAI(*UseMI) && RewriteSet.contains(UseMI))
+      }
+      if (TII->isMAI(*UseMI) && RewriteSet.contains(UseMI)) {
+        LLVM_DEBUG(dbgs() << "        -> skip (MAI in RewriteSet)\n");
         continue;
-      // Check if the user operand accepts AGPR.
-      unsigned OpIdx = UseMO->getOperandNo();
-      const TargetRegisterClass *OpRC =
-          TII->getRegClass(UseMI->getDesc(), OpIdx);
-      if (!OpRC || SRI->isAGPRClass(OpRC) || SRI->isVectorSuperClass(OpRC))
+      }
+      // If the reaching def is a candidate MFMA (in RewriteSet), its dst
+      // processing will insert bridge copies for any VGPR-requiring user.
+      // Non-candidate MAI users reachable from a candidate def don't force
+      // src2 to stay VGPR.
+      if (TII->isMAI(*UseMI) && TII->isMAI(*RD) &&
+          RewriteSet.contains(RD)) {
+        LLVM_DEBUG(dbgs() << "        -> skip (MAI user of candidate def)\n");
         continue;
+      }
+      if (operandAcceptsAGPR(*UseMI, UseMO->getOperandNo())) {
+        LLVM_DEBUG(dbgs() << "        -> skip (opidx "
+                          << UseMO->getOperandNo() << " accepts AGPR)\n");
+        continue;
+      }
+      LLVM_DEBUG(dbgs() << "        -> REQUIRES VGPR (opidx "
+                        << UseMO->getOperandNo() << ")\n"
+                        << "  [hasUseRequiringVGPR] result: true\n");
       return true;
     }
   }
+  LLVM_DEBUG(dbgs() << "  [hasUseRequiringVGPR] result: false\n");
   return false;
+}
+
+bool RewriteMFMAFormStage::hasDefRequiringVGPR(Register Reg) {
+  LLVM_DEBUG(dbgs() << "  [hasDefRequiringVGPR] checking "
+                    << printReg(Reg, SRI) << '\n');
+  for (MachineInstr &DefMI : DAG.MRI.def_instructions(Reg)) {
+    LLVM_DEBUG(dbgs() << "    def: " << DefMI);
+    if (DefMI.isCopy() || DefMI.isImplicitDef()) {
+      LLVM_DEBUG(dbgs() << "      -> skip (copy/implicit_def)\n");
+      continue;
+    }
+    // Any MAI that could be rewritten to AGPR form will produce AGPR.
+    // This includes MFMAs not yet in RewriteSet (chicken-and-egg: we're
+    // building RewriteSet, so the candidate itself isn't in it yet).
+    if (isRewriteCandidate(&DefMI)) {
+      LLVM_DEBUG(dbgs() << "      -> skip (rewrite candidate MAI)\n");
+      continue;
+    }
+    unsigned DefOpIdx =
+        DefMI.findRegisterDefOperandIdx(Reg, /*TRI=*/nullptr);
+    if (DefOpIdx == ~0u) {
+      LLVM_DEBUG(dbgs() << "      -> skip (no def operand idx)\n");
+      continue;
+    }
+    if (operandAcceptsAGPR(DefMI, DefOpIdx)) {
+      LLVM_DEBUG(dbgs() << "      -> skip (opidx " << DefOpIdx
+                        << " accepts AGPR)\n");
+      continue;
+    }
+    LLVM_DEBUG(dbgs() << "      -> REQUIRES VGPR (opidx " << DefOpIdx
+                      << ")\n");
+    LLVM_DEBUG(dbgs() << "  [hasDefRequiringVGPR] " << printReg(Reg, SRI)
+                      << " result: true\n");
+    return true;
+  }
+  LLVM_DEBUG(dbgs() << "  [hasDefRequiringVGPR] " << printReg(Reg, SRI)
+                    << " result: false\n");
+  return false;
+}
+
+bool RewriteMFMAFormStage::operandAcceptsAGPR(const MachineInstr &MI,
+                                              unsigned OpIdx) const {
+  if (MI.isInlineAsm())
+    return false;
+  const TargetRegisterClass *RC = TII->getRegClass(MI.getDesc(), OpIdx);
+  if (!RC)
+    return true;
+  return SRI->isAGPRClass(RC) || SRI->isVectorSuperClass(RC);
 }
 
 void RewriteMFMAFormStage::resetRewriteCandsToVGPR(
     ArrayRef<std::pair<MachineInstr *, unsigned>> RewriteCands) {
+  LLVM_DEBUG(dbgs() << "=== resetRewriteCandsToVGPR: " << RewriteCands.size()
+                    << " candidates ===\n");
   for (auto [MI, OriginalOpcode] : RewriteCands) {
     assert(TII->isMAI(*MI));
     const TargetRegisterClass *ADefRC =
         DAG.MRI.getRegClass(MI->getOperand(0).getReg());
     const TargetRegisterClass *VDefRC = SRI->getEquivalentVGPRClass(ADefRC);
+    LLVM_DEBUG(dbgs() << "  reset dst "
+                      << printReg(MI->getOperand(0).getReg(), SRI) << " "
+                      << SRI->getRegClassName(ADefRC) << " -> "
+                      << SRI->getRegClassName(VDefRC) << " in " << *MI);
     DAG.MRI.setRegClass(MI->getOperand(0).getReg(), VDefRC);
     MI->setDesc(TII->get(OriginalOpcode));
 
     MachineOperand *Src2 = TII->getNamedOperand(*MI, AMDGPU::OpName::src2);
     if (!Src2->isReg())
+      continue;
+    // Only reset src2 class if initHeuristics actually reclassed it.
+    if (Src2NeedsVGPRCache.lookup(MI))
       continue;
 
     // Have to get src types separately since subregs may cause C and D
@@ -2372,15 +2454,23 @@ void RewriteMFMAFormStage::resetRewriteCandsToVGPR(
     // the same size.
     const TargetRegisterClass *AUseRC = DAG.MRI.getRegClass(Src2->getReg());
     const TargetRegisterClass *VUseRC = SRI->getEquivalentVGPRClass(AUseRC);
+    LLVM_DEBUG(dbgs() << "  reset src2 " << printReg(Src2->getReg(), SRI) << " "
+                      << SRI->getRegClassName(AUseRC) << " -> "
+                      << SRI->getRegClassName(VUseRC) << '\n');
     DAG.MRI.setRegClass(Src2->getReg(), VUseRC);
   }
 }
 
 bool RewriteMFMAFormStage::isRewriteCandidate(MachineInstr *MI) const {
+  // Not printing the non-MAI rejection: it fires on every MI in the function.
   if (!static_cast<const SIInstrInfo *>(DAG.TII)->isMAI(*MI))
     return false;
-  if (AMDGPU::getAGPRFormOp(MI->getOpcode()) == -1)
+  if (AMDGPU::getAGPRFormOp(MI->getOpcode()) == -1) {
+    LLVM_DEBUG(dbgs() << "  [isRewriteCandidate] reject (no AGPR form): "
+                      << *MI);
     return false;
+  }
+  LLVM_DEBUG(dbgs() << "  [isRewriteCandidate] accept: " << *MI);
   return true;
 }
 
@@ -2390,6 +2480,10 @@ bool RewriteMFMAFormStage::initHeuristics(
     SmallPtrSetImpl<MachineInstr *> &CopyForDef) {
   bool Changed = false;
 
+  LLVM_DEBUG(dbgs() << "\n===== RewriteMFMAFormStage::initHeuristics for "
+                    << MF.getName() << " =====\n"
+                    << "--- Phase 1: collect RewriteSet ---\n");
+
   // Collect the candidate group, its members share AGPR-form operands
   // post-rewrite, so reaching defs feeding any member don't need bridge copy.
   SmallPtrSet<MachineInstr *, 16> RewriteSet;
@@ -2398,18 +2492,41 @@ bool RewriteMFMAFormStage::initHeuristics(
     for (MachineInstr &MI : MBB) {
       if (!isRewriteCandidate(&MI))
         continue;
+      // Reject candidates whose dst has a def that can't produce AGPR
+      // (e.g. V_ADD_U32 defining a subreg of the accumulator register).
+      if (hasDefRequiringVGPR(MI.getOperand(0).getReg())) {
+        LLVM_DEBUG(dbgs() << "  -> REJECTED (dst has def requiring VGPR): "
+                          << MI);
+        continue;
+      }
+      LLVM_DEBUG(dbgs() << "  -> ADDED to RewriteSet: " << MI);
       RewriteSet.insert(&MI);
       MachineOperand *Src2 = TII->getNamedOperand(MI, AMDGPU::OpName::src2);
-      if (Src2 && Src2->isReg())
+      if (Src2 && Src2->isReg()) {
+        LLVM_DEBUG(dbgs() << "     CandSrc2Regs += "
+                          << printReg(Src2->getReg(), SRI) << '\n');
         CandSrc2Regs.insert(Src2->getReg());
+      }
     }
   }
 
-  // Prepare for the heuristics
+  LLVM_DEBUG({
+    dbgs() << "--- RewriteSet contents (" << RewriteSet.size() << ") ---\n";
+    for (MachineInstr *MI : RewriteSet)
+      dbgs() << "  " << *MI;
+    dbgs() << "--- CandSrc2Regs (" << CandSrc2Regs.size() << "): ";
+    for (Register R : CandSrc2Regs)
+      dbgs() << printReg(R, SRI) << ' ';
+    dbgs() << "\n--- Phase 2: per-MFMA heuristics ---\n";
+  });
+
+  // Prepare for the heuristics — only process MFMAs in RewriteSet.
   for (MachineBasicBlock &MBB : MF) {
     for (MachineInstr &MI : MBB) {
-      if (!isRewriteCandidate(&MI))
+      if (!RewriteSet.contains(&MI))
         continue;
+
+      LLVM_DEBUG(dbgs() << "\n [phase2] MFMA: " << MI);
 
       int ReplacementOp = AMDGPU::getAGPRFormOp(MI.getOpcode());
       assert(ReplacementOp != -1);
@@ -2424,18 +2541,31 @@ bool RewriteMFMAFormStage::initHeuristics(
 
         // If src2 has a use that must remain VGPR, it cannot be reclassified to
         // AGPR.
-        bool Src2NeedsVGPR = hasUseRequiringVGPR(Src2ReachingDefs, RewriteSet);
+        LLVM_DEBUG(dbgs() << "  src2 = " << printReg(Src2->getReg(), SRI)
+                          << ", " << Src2ReachingDefs.size()
+                          << " reaching defs\n");
+
+        bool Src2NeedsVGPR = hasUseRequiringVGPR(Src2ReachingDefs, RewriteSet) ||
+                             hasDefRequiringVGPR(Src2->getReg());
         Src2NeedsVGPRCache[&MI] = Src2NeedsVGPR;
+        LLVM_DEBUG(dbgs() << "  Src2NeedsVGPR = " << Src2NeedsVGPR << '\n');
 
         for (SlotIndex RDIdx : Src2ReachingDefs) {
           MachineInstr *RD = DAG.LIS->getInstructionFromIndex(RDIdx);
+          LLVM_DEBUG(dbgs() << "  src2 reaching def: " << *RD);
           if (!Src2NeedsVGPR &&
-              isReachingDefAGPRForm(RD, RewriteSet, CandSrc2Regs, *TII))
+              isReachingDefAGPRForm(RD, RewriteSet, CandSrc2Regs, *TII)) {
+            LLVM_DEBUG(dbgs() << "    -> skip (already AGPR form)\n");
             continue;
+          }
           // When Src2NeedsVGPR, still skip candidate MAI reaching defs — they
           // will produce AGPR and don't need bridge copies.
-          if (Src2NeedsVGPR && TII->isMAI(*RD) && RewriteSet.contains(RD))
+          if (Src2NeedsVGPR && TII->isMAI(*RD) && RewriteSet.contains(RD)) {
+            LLVM_DEBUG(dbgs()
+                       << "    -> skip (Src2NeedsVGPR, MAI in RewriteSet)\n");
             continue;
+          }
+          LLVM_DEBUG(dbgs() << "    -> CopyForDef += this def\n");
           CopyForDef.insert(RD);
         }
       }
@@ -2445,39 +2575,52 @@ bool RewriteMFMAFormStage::initHeuristics(
 
       findReachingUses(&MI, DAG.LIS, DstReachingUses);
 
+      LLVM_DEBUG(dbgs() << "  dst = " << printReg(Dst.getReg(), SRI) << ", "
+                        << DstReachingUses.size() << " reaching uses\n");
+
       for (MachineOperand *RUOp : DstReachingUses) {
         MachineInstr *UserMI = RUOp->getParent();
+        LLVM_DEBUG(dbgs() << "  dst reaching use: " << *UserMI);
         // Group members read the AGPR result directly.
-        if (TII->isMAI(*UserMI) && RewriteSet.contains(UserMI))
+        if (TII->isMAI(*UserMI) && RewriteSet.contains(UserMI)) {
+          LLVM_DEBUG(dbgs() << "    -> skip (MAI in RewriteSet)\n");
           continue;
+        }
 
-        // Check if the user operand accepts AGPR — no copy needed.
-        unsigned OpIdx = RUOp->getOperandNo();
-        const TargetRegisterClass *OpRC =
-            TII->getRegClass(UserMI->getDesc(), OpIdx);
-        if (!OpRC || SRI->isAGPRClass(OpRC) || SRI->isVectorSuperClass(OpRC))
+        if (operandAcceptsAGPR(*UserMI, RUOp->getOperandNo())) {
+          LLVM_DEBUG(dbgs() << "    -> skip (opidx " << RUOp->getOperandNo()
+                            << " accepts AGPR)\n");
           continue;
+        }
 
         // For any user of the result of the MFMA which cannot accept AGPR,
         // we insert a copy. For a given register, we will only insert one
         // copy per user block.
+        LLVM_DEBUG(dbgs() << "    -> CopyForUse[bb." << UserMI->getParent()->getNumber()
+                          << "] += " << printReg(RUOp->getReg(), SRI) << '\n');
         CopyForUse[UserMI->getParent()].insert(RUOp->getReg());
 
-        if (TII->isMAI(*UserMI))
+        if (TII->isMAI(*UserMI)) {
+          LLVM_DEBUG(dbgs() << "    -> stop (non-candidate MAI user)\n");
           continue;
+        }
 
         SmallVector<SlotIndex, 8> DstUsesReachingDefs;
         findReachingDefs(*RUOp, DAG.LIS, DstUsesReachingDefs);
 
         for (SlotIndex RDIndex : DstUsesReachingDefs) {
           MachineInstr *RD = DAG.LIS->getInstructionFromIndex(RDIndex);
-          if (TII->isMAI(*RD))
+          LLVM_DEBUG(dbgs() << "    use's reaching def: " << *RD);
+          if (TII->isMAI(*RD)) {
+            LLVM_DEBUG(dbgs() << "      -> skip (MAI)\n");
             continue;
+          }
 
           // For any definition of the user of the MFMA which is not an MFMA,
           // we insert a copy. We do this to transform all the reaching defs
           // of this use to AGPR. By doing this, we can insert a copy from
           // AGPR to VGPR at the user rather than after the MFMA.
+          LLVM_DEBUG(dbgs() << "      -> CopyForDef += this def\n");
           CopyForDef.insert(RD);
         }
       }
@@ -2485,42 +2628,32 @@ bool RewriteMFMAFormStage::initHeuristics(
       // Do the rewrite to allow for updated RP calculation.
       const TargetRegisterClass *VDefRC = DAG.MRI.getRegClass(Dst.getReg());
       const TargetRegisterClass *ADefRC = SRI->getEquivalentAGPRClass(VDefRC);
+      LLVM_DEBUG(dbgs() << "  reclass dst " << printReg(Dst.getReg(), SRI)
+                        << " " << SRI->getRegClassName(VDefRC) << " -> "
+                        << SRI->getRegClassName(ADefRC) << '\n');
       DAG.MRI.setRegClass(Dst.getReg(), ADefRC);
-      if (Src2->isReg()) {
+      if (Src2->isReg() && !Src2NeedsVGPRCache[&MI]) {
         // Have to get src types separately since subregs may cause C and D
         // registers to be different types even though the actual operand is
         // the same size.
-        // Only reclassify to AGPR if all defining instructions can produce
-        // AGPR output. Non-MAI instructions (e.g. V_ADD_U32) can only write
-        // VGPRs and must not have their output reclassed to AGPR.
-        bool AllDefsCanProduceAGPR = true;
-        for (MachineInstr &DefMI :
-             DAG.MRI.def_instructions(Src2->getReg())) {
-          if (TII->isMAI(DefMI) || DefMI.isCopy() || DefMI.isImplicitDef())
-            continue;
-          unsigned DefOpIdx =
-              DefMI.findRegisterDefOperandIdx(Src2->getReg(), /*TRI=*/nullptr);
-          if (DefOpIdx == ~0u)
-            continue;
-          const TargetRegisterClass *DefOpRC =
-              TII->getRegClass(DefMI.getDesc(), DefOpIdx);
-          if (DefOpRC && !SRI->isAGPRClass(DefOpRC) &&
-              !SRI->isVectorSuperClass(DefOpRC)) {
-            AllDefsCanProduceAGPR = false;
-            break;
-          }
-        }
-        if (AllDefsCanProduceAGPR) {
-          const TargetRegisterClass *VUseRC =
-              DAG.MRI.getRegClass(Src2->getReg());
-          const TargetRegisterClass *AUseRC =
-              SRI->getEquivalentAGPRClass(VUseRC);
-          DAG.MRI.setRegClass(Src2->getReg(), AUseRC);
-        }
+        const TargetRegisterClass *VUseRC = DAG.MRI.getRegClass(Src2->getReg());
+        const TargetRegisterClass *AUseRC = SRI->getEquivalentAGPRClass(VUseRC);
+        LLVM_DEBUG(dbgs() << "  reclass src2 " << printReg(Src2->getReg(), SRI)
+                          << " " << SRI->getRegClassName(VUseRC) << " -> "
+                          << SRI->getRegClassName(AUseRC) << '\n');
+        DAG.MRI.setRegClass(Src2->getReg(), AUseRC);
+      } else if (Src2->isReg()) {
+        LLVM_DEBUG(dbgs() << "  src2 " << printReg(Src2->getReg(), SRI)
+                          << " NOT reclassed (Src2NeedsVGPR)\n");
       }
       Changed = true;
     }
   }
+
+  LLVM_DEBUG(dbgs() << "===== initHeuristics done: " << RewriteCands.size()
+                    << " RewriteCands, " << CopyForDef.size()
+                    << " CopyForDef, " << CopyForUse.size()
+                    << " CopyForUse blocks, Changed=" << Changed << " =====\n");
 
   return Changed;
 }
@@ -2705,10 +2838,22 @@ bool RewriteMFMAFormStage::rewrite(
       RewriteSrc2Regs.insert(Src2->getReg());
   }
 
+  LLVM_DEBUG({
+    dbgs() << "\n===== RewriteMFMAFormStage::rewrite: " << RewriteCands.size()
+           << " candidates =====\n"
+           << "  RewriteSrc2Regs: ";
+    for (Register R : RewriteSrc2Regs)
+      dbgs() << printReg(R, SRI) << ' ';
+    dbgs() << '\n';
+  });
+
   for (auto &[MI, OriginalOpcode] : RewriteCands) {
     int ReplacementOp = AMDGPU::getAGPRFormOp(MI->getOpcode());
-    if (ReplacementOp == -1)
+    if (ReplacementOp == -1) {
+      LLVM_DEBUG(dbgs() << "\n [rewrite] skip (no AGPR form): " << *MI);
       continue;
+    }
+    LLVM_DEBUG(dbgs() << "\n [rewrite] setDesc AGPR form for: " << *MI);
     MI->setDesc(TII->get(ReplacementOp));
 
     // Case 1: insert copies for the reaching defs of the Src2Reg.
@@ -2726,17 +2871,28 @@ bool RewriteMFMAFormStage::rewrite(
       // If src2 has a use that must remain VGPR, it cannot be reclassified to
       // AGPR.
       bool Src2NeedsVGPR = Src2NeedsVGPRCache.lookup(MI);
+      LLVM_DEBUG(dbgs() << "   src2 = " << printReg(Src2Reg, SRI)
+                        << ", Src2NeedsVGPR (cached) = " << Src2NeedsVGPR
+                        << ", " << Src2ReachingDefs.size()
+                        << " reaching defs\n");
 
       for (SlotIndex RDIndex : Src2ReachingDefs) {
         MachineInstr *RD = DAG.LIS->getInstructionFromIndex(RDIndex);
+        LLVM_DEBUG(dbgs() << "   src2 RD: " << *RD);
         if (!Src2NeedsVGPR &&
-            isReachingDefAGPRForm(RD, RewriteCandsSet, RewriteSrc2Regs, *TII))
+            isReachingDefAGPRForm(RD, RewriteCandsSet, RewriteSrc2Regs, *TII)) {
+          LLVM_DEBUG(dbgs() << "     -> skip (already AGPR form)\n");
           continue;
+        }
         // When Src2NeedsVGPR, still skip candidate MAI reaching defs — they
         // will produce AGPR and don't need bridge copies.
-        if (Src2NeedsVGPR && TII->isMAI(*RD) && RewriteCandsSet.contains(RD))
+        if (Src2NeedsVGPR && TII->isMAI(*RD) && RewriteCandsSet.contains(RD)) {
+          LLVM_DEBUG(dbgs()
+                     << "     -> skip (Src2NeedsVGPR, MAI in RewriteCands)\n");
           continue;
+        }
 
+        LLVM_DEBUG(dbgs() << "     -> Src2DefsReplace += this def\n");
         Src2DefsReplace.insert(RD);
       }
 
@@ -2755,6 +2911,9 @@ bool RewriteMFMAFormStage::rewrite(
 
           // Track the mapping of the original register to the new register.
           MappedReg = DAG.MRI.createVirtualRegister(VGPRRC);
+          LLVM_DEBUG(dbgs() << "     RedefMap[" << printReg(Src2Reg, SRI)
+                            << "] = " << printReg(MappedReg, SRI) << " ("
+                            << SRI->getRegClassName(VGPRRC) << ")\n");
           RedefMap[Src2Reg] = MappedReg;
         }
 
@@ -2763,6 +2922,9 @@ bool RewriteMFMAFormStage::rewrite(
         for (MachineInstr *RD : Src2DefsReplace) {
           // Do not create redundant copies.
           if (ReachingDefCopyMap[Src2Reg].insert(RD).second) {
+            LLVM_DEBUG(dbgs() << "     insert COPY "
+                              << printReg(MappedReg, SRI) << " = "
+                              << printReg(Src2Reg, SRI) << " after: " << *RD);
             MachineInstrBuilder VGPRCopy =
                 BuildMI(*RD->getParent(), std::next(RD->getIterator()),
                         RD->getDebugLoc(), TII->get(TargetOpcode::COPY))
@@ -2782,6 +2944,10 @@ bool RewriteMFMAFormStage::rewrite(
       }
 
       // Track the register for reclassification
+      LLVM_DEBUG(dbgs() << "   RewriteRegs += " << printReg(Src2Reg, SRI)
+                        << " (src2)\n"
+                        << "   ReplaceMap[" << printReg(Src2Reg, SRI)
+                        << "] += src2 operand of " << *MI);
       RewriteRegs.insert(Src2Reg);
 
       // Always insert the operand for replacement. If this corresponds with a
@@ -2805,43 +2971,92 @@ bool RewriteMFMAFormStage::rewrite(
 
     findReachingUses(MI, DAG.LIS, DstReachingUses);
 
+    LLVM_DEBUG(dbgs() << "   dst = " << printReg(DstReg, SRI) << ", "
+                      << DstReachingUses.size() << " reaching uses\n");
+
+    // Pass 1: classify dst reaching uses into AGPR-accepting vs VGPR-requiring.
+    SmallVector<MachineOperand *, 8> DstAGPRUses;
     for (MachineOperand *RUOp : DstReachingUses) {
       MachineInstr *UserMI = RUOp->getParent();
-      // Group members read the AGPR result directly.
-      if (TII->isMAI(*UserMI) && RewriteCandsSet.contains(UserMI))
-        continue;
-
-      // Check if the user operand accepts AGPR — no copy needed, but still
-      // track the operand for register rename when RedefMap applies.
-      unsigned OpIdx = RUOp->getOperandNo();
-      const TargetRegisterClass *OpRC =
-          TII->getRegClass(UserMI->getDesc(), OpIdx);
-      if (!OpRC || SRI->isAGPRClass(OpRC) || SRI->isVectorSuperClass(OpRC)) {
-        ReplaceMap[DstReg].insert(RUOp);
+      LLVM_DEBUG(dbgs() << "   dst RU: " << *UserMI);
+      if (TII->isMAI(*UserMI) && RewriteCandsSet.contains(UserMI)) {
+        LLVM_DEBUG(dbgs() << "     -> skip (MAI in RewriteCands)\n");
         continue;
       }
 
-      // If the user cannot accept AGPR, we need a copy.
-      if (find(DstReachingUseCopies, RUOp) == DstReachingUseCopies.end())
-        DstReachingUseCopies.push_back(RUOp);
-
-      // Non-rewritten MAI: its defs aren't being reclassified.
-      if (TII->isMAI(*UserMI))
+      if (operandAcceptsAGPR(*UserMI, RUOp->getOperandNo())) {
+        LLVM_DEBUG(dbgs() << "     -> accepts AGPR\n");
+        DstAGPRUses.push_back(RUOp);
         continue;
+      }
+
+      if (find(DstReachingUseCopies, RUOp) == DstReachingUseCopies.end()) {
+        LLVM_DEBUG(dbgs() << "     -> DstReachingUseCopies += opidx "
+                          << RUOp->getOperandNo() << '\n');
+        DstReachingUseCopies.push_back(RUOp);
+      }
+
+      if (TII->isMAI(*UserMI)) {
+        LLVM_DEBUG(dbgs() << "     -> stop (non-candidate MAI user)\n");
+        continue;
+      }
 
       SmallVector<SlotIndex, 8> DstUsesReachingDefs;
       findReachingDefs(*RUOp, DAG.LIS, DstUsesReachingDefs);
 
       for (SlotIndex RDIndex : DstUsesReachingDefs) {
         MachineInstr *RD = DAG.LIS->getInstructionFromIndex(RDIndex);
-        if (TII->isMAI(*RD))
+        LLVM_DEBUG(dbgs() << "     use's RD: " << *RD);
+        if (TII->isMAI(*RD)) {
+          LLVM_DEBUG(dbgs() << "       -> skip (MAI)\n");
+          continue;
+        }
+
+        if (find(DstUseDefsReplace, RD) == DstUseDefsReplace.end()) {
+          LLVM_DEBUG(dbgs() << "       -> DstUseDefsReplace += this def\n");
+          DstUseDefsReplace.push_back(RD);
+        }
+      }
+    }
+
+    // Pass 2: if a RedefMap split will happen (VGPR users exist or src2
+    // processing already created one), AGPR-accepting users must also be
+    // renamed and their reaching defs collected. Otherwise they just use
+    // the original register reclassified to AGPR -- no split needed.
+    bool NeedsDstSplit = RedefMap.count(DstReg);
+    if (NeedsDstSplit) {
+      for (MachineOperand *RUOp : DstAGPRUses) {
+        MachineInstr *UserMI = RUOp->getParent();
+        LLVM_DEBUG(dbgs() << "   dst AGPR RU (split): ReplaceMap["
+                          << printReg(DstReg, SRI) << "] += opidx "
+                          << RUOp->getOperandNo() << " of " << *UserMI);
+        ReplaceMap[DstReg].insert(RUOp);
+
+        if (TII->isMAI(*UserMI))
           continue;
 
-        // If there is a non mai reaching def of this reaching use, then we will
-        // need a copy.
-        if (find(DstUseDefsReplace, RD) == DstUseDefsReplace.end())
-          DstUseDefsReplace.push_back(RD);
+        SmallVector<SlotIndex, 8> DstUsesReachingDefs;
+        findReachingDefs(*RUOp, DAG.LIS, DstUsesReachingDefs);
+
+        for (SlotIndex RDIndex : DstUsesReachingDefs) {
+          MachineInstr *RD = DAG.LIS->getInstructionFromIndex(RDIndex);
+          LLVM_DEBUG(dbgs() << "     use's RD: " << *RD);
+          if (TII->isMAI(*RD)) {
+            LLVM_DEBUG(dbgs() << "       -> skip (MAI)\n");
+            continue;
+          }
+
+          if (find(DstUseDefsReplace, RD) == DstUseDefsReplace.end()) {
+            LLVM_DEBUG(dbgs() << "       -> DstUseDefsReplace += this def\n");
+            DstUseDefsReplace.push_back(RD);
+          }
+        }
       }
+    } else {
+      LLVM_DEBUG({
+        if (!DstAGPRUses.empty())
+          dbgs() << "   dst: all users accept AGPR, no split needed\n";
+      });
     }
 
     if (!DstUseDefsReplace.empty()) {
@@ -2855,14 +3070,20 @@ bool RewriteMFMAFormStage::rewrite(
 
         // Track the mapping of the original register to the new register.
         MappedReg = DAG.MRI.createVirtualRegister(VGPRRC);
+        LLVM_DEBUG(dbgs() << "   RedefMap[" << printReg(DstReg, SRI)
+                          << "] = " << printReg(MappedReg, SRI) << " ("
+                          << SRI->getRegClassName(VGPRRC) << ")\n");
         RedefMap[DstReg] = MappedReg;
       }
 
       // If none exists, create a copy from this reaching def.
       // We may have inserted a copy already in an earlier iteration.
       for (MachineInstr *RD : DstUseDefsReplace) {
-        // Do not create reundant copies.
+        // Do not create redundant copies.
         if (ReachingDefCopyMap[DstReg].insert(RD).second) {
+          LLVM_DEBUG(dbgs() << "   insert COPY " << printReg(MappedReg, SRI)
+                            << " = " << printReg(DstReg, SRI)
+                            << " after: " << *RD);
           MachineInstrBuilder VGPRCopy =
               BuildMI(*RD->getParent(), std::next(RD->getIterator()),
                       RD->getDebugLoc(), TII->get(TargetOpcode::COPY))
@@ -2900,6 +3121,9 @@ bool RewriteMFMAFormStage::rewrite(
         const TargetRegisterClass *DstRC = DAG.MRI.getRegClass(DstReg);
         const TargetRegisterClass *VGPRRC = SRI->getEquivalentVGPRClass(DstRC);
         SameBlockCopyReg = DAG.MRI.createVirtualRegister(VGPRRC);
+        LLVM_DEBUG(dbgs() << "   SameBlockCopyReg for "
+                          << printReg(DstReg, SRI) << " = "
+                          << printReg(SameBlockCopyReg, SRI) << '\n');
       }
 
       // Track the earliest use for copy insertion point.
@@ -2909,11 +3133,18 @@ bool RewriteMFMAFormStage::rewrite(
               DAG.LIS->getInstructionIndex(*UseInst),
               DAG.LIS->getInstructionIndex(*EarliestSameBlockUse)))
         EarliestSameBlockUse = UseInst;
+      LLVM_DEBUG(dbgs() << "   same-block use -> setReg "
+                        << printReg(SameBlockCopyReg, SRI) << " in "
+                        << *UseInst);
       RU->setReg(SameBlockCopyReg);
     }
 
     // Insert the copy before the earliest same-block use.
     if (SameBlockCopyReg.isValid()) {
+      LLVM_DEBUG(dbgs() << "   insert COPY "
+                        << printReg(SameBlockCopyReg, SRI) << " = "
+                        << printReg(DstReg, SRI)
+                        << " before: " << *EarliestSameBlockUse);
       MachineInstrBuilder VGPRCopy =
           BuildMI(*EarliestSameBlockUse->getParent(),
                   EarliestSameBlockUse->getIterator(), DebugLoc(),
@@ -2924,6 +3155,10 @@ bool RewriteMFMAFormStage::rewrite(
     }
 
     // Track the register for reclassification
+    LLVM_DEBUG(dbgs() << "   RewriteRegs += " << printReg(DstReg, SRI)
+                      << " (dst)\n"
+                      << "   ReplaceMap[" << printReg(DstReg, SRI)
+                      << "] += dst operand of " << *MI);
     RewriteRegs.insert(DstReg);
 
     // Insert the dst operand for replacement. If this dst is in a chain of
@@ -2953,6 +3188,12 @@ bool RewriteMFMAFormStage::rewrite(
       Register NewUseReg = DAG.MRI.createVirtualRegister(VGPRRC);
       MachineInstr *UseInst = DAG.LIS->getInstructionFromIndex(InstPt);
 
+      LLVM_DEBUG(dbgs() << "\n [rewrite] cross-block use copy in bb."
+                        << RUBlockEntry.first << ": "
+                        << printReg(NewUseReg, SRI) << " = "
+                        << printReg(RUDst.first, SRI)
+                        << " before: " << *UseInst);
+
       MachineInstrBuilder VGPRCopy =
           BuildMI(*UseInst->getParent(), UseInst->getIterator(),
                   UseInst->getDebugLoc(), TII->get(TargetOpcode::COPY))
@@ -2971,6 +3212,8 @@ bool RewriteMFMAFormStage::rewrite(
 
       // Replace the operand for all users.
       for (MachineOperand *User : RUDst.second) {
+        LLVM_DEBUG(dbgs() << "   setReg " << printReg(NewUseReg, SRI) << " in "
+                          << *User->getParent());
         User->setReg(NewUseReg);
       }
 
@@ -2982,15 +3225,26 @@ bool RewriteMFMAFormStage::rewrite(
   // We may have needed to insert copies after the reaching defs of the MFMAs.
   // Replace the original register with the result of the copy for all relevant
   // operands.
+  LLVM_DEBUG(dbgs() << "\n [rewrite] applying RedefMap (" << RedefMap.size()
+                    << " entries)\n");
   for (std::pair<Register, Register> NewDef : RedefMap) {
     Register OldReg = NewDef.first;
     Register NewReg = NewDef.second;
 
+    LLVM_DEBUG(dbgs() << "   " << printReg(OldReg, SRI) << " -> "
+                      << printReg(NewReg, SRI) << " in "
+                      << ReplaceMap[OldReg].size() << " operands\n");
+
     // Replace the register for any associated operand in the MFMA chain.
-    for (MachineOperand *ReplaceOp : ReplaceMap[OldReg])
+    for (MachineOperand *ReplaceOp : ReplaceMap[OldReg]) {
+      LLVM_DEBUG(dbgs() << "     opidx " << ReplaceOp->getOperandNo() << " of "
+                        << *ReplaceOp->getParent());
       ReplaceOp->setReg(NewReg);
+    }
   }
 
+  LLVM_DEBUG(dbgs() << "\n [rewrite] reclassifying " << RewriteRegs.size()
+                    << " regs to AGPR\n");
   // Finally, do the reclassification of the MFMA registers.
   for (Register RewriteReg : RewriteRegs) {
     Register RegToRewrite = RewriteReg;
@@ -3000,37 +3254,29 @@ bool RewriteMFMAFormStage::rewrite(
     if (RI != RedefMap.end())
       RegToRewrite = RI->second;
 
-    // Check if all defs of this register can produce AGPR. If any def
-    // is a non-MAI instruction (e.g. V_ADD_U32), it can only write VGPRs
-    // and must not have its output reclassed to AGPR.
-    bool CanReclass = true;
-    for (MachineInstr &DefMI :
-         DAG.MRI.def_instructions(RegToRewrite)) {
-      if (TII->isMAI(DefMI) || DefMI.isCopy() || DefMI.isImplicitDef())
-        continue;
-      unsigned DefOpIdx =
-          DefMI.findRegisterDefOperandIdx(RegToRewrite, /*TRI=*/nullptr);
-      if (DefOpIdx == ~0u)
-        continue;
-      const TargetRegisterClass *DefOpRC =
-          TII->getRegClass(DefMI.getDesc(), DefOpIdx);
-      if (DefOpRC && !SRI->isAGPRClass(DefOpRC) &&
-          !SRI->isVectorSuperClass(DefOpRC)) {
-        CanReclass = false;
-        break;
-      }
-    }
-    if (!CanReclass)
-      continue;
-
     const TargetRegisterClass *CurrRC = DAG.MRI.getRegClass(RegToRewrite);
     const TargetRegisterClass *AGPRRC = SRI->getEquivalentAGPRClass(CurrRC);
+
+    LLVM_DEBUG(dbgs() << "   " << printReg(RewriteReg, SRI) << " (rewriting "
+                      << printReg(RegToRewrite, SRI) << ") "
+                      << SRI->getRegClassName(CurrRC) << " -> "
+                      << (AGPRRC ? SRI->getRegClassName(AGPRRC) : "null")
+                      << '\n');
 
     DAG.MRI.setRegClass(RegToRewrite, AGPRRC);
   }
 
   // Bulk update the LIS.
   DAG.LIS->reanalyze(DAG.MF);
+  // Src2 redirection may disconnect live ranges — split them.
+  for (unsigned I = 0, E = DAG.MRI.getNumVirtRegs(); I != E; ++I) {
+    Register Reg = Register::index2VirtReg(I);
+    if (!DAG.LIS->hasInterval(Reg))
+      continue;
+    LiveInterval &LI = DAG.LIS->getInterval(Reg);
+    SmallVector<LiveInterval *> SplitLIs;
+    DAG.LIS->splitSeparateComponents(LI, SplitLIs);
+  }
   // Liveins may have been modified for cross RC copies
   RegionPressureMap LiveInUpdater(&DAG, false);
   LiveInUpdater.buildLiveRegMap();

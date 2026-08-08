@@ -384,10 +384,11 @@ define amdgpu_kernel void @test_spill_cost_reset(
   ; CHECK-NEXT: bb.1.loop:
   ; CHECK-NEXT:   successors: %bb.2(0x04000000), %bb.1(0x7c000000)
   ; CHECK-NEXT: {{  $}}
-  ; CHECK-NEXT:   [[V_MOV_B32_e32_12:%[0-9]+]]:vreg_128_align2 = V_MFMA_F32_16X16X32_F16_vgprcd_e64 [[COPY1]], [[COPY2]], [[V_MOV_B32_e32_12]], 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[COPY131:%[0-9]+]]:vreg_64_align2 = nofpexcept V_PK_ADD_F32 8, [[COPY131]], 8, [[COPY131]], 0, 0, 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[COPY130:%[0-9]+]]:vreg_64_align2 = nofpexcept V_PK_ADD_F32 8, [[COPY130]], 8, [[COPY130]], 0, 0, 0, 0, 0, implicit $mode, implicit $exec
+  ; CHECK-NEXT:   [[V_MOV_B32_e32_12:%[0-9]+]]:vreg_128_align2 = V_MFMA_F32_16X16X32_F16_vgprcd_e64 [[COPY1]], [[COPY2]], [[V_MOV_B32_e32_12]], 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[COPY129:%[0-9]+]]:vreg_64_align2 = nofpexcept V_PK_ADD_F32 8, [[COPY129]], 8, [[COPY129]], 0, 0, 0, 0, 0, implicit $mode, implicit $exec
+  ; CHECK-NEXT:   [[COPY132:%[0-9]+]]:areg_128_align2 = COPY [[V_MOV_B32_e32_12]]
   ; CHECK-NEXT:   [[COPY128:%[0-9]+]]:vreg_64_align2 = nofpexcept V_PK_ADD_F32 8, [[COPY128]], 8, [[COPY128]], 0, 0, 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[COPY127:%[0-9]+]]:vreg_64_align2 = nofpexcept V_PK_ADD_F32 8, [[COPY127]], 8, [[COPY127]], 0, 0, 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[V_MOV_B32_e32_11:%[0-9]+]]:vreg_128_align2 = V_MFMA_F32_16X16X32_F16_vgprcd_e64 [[COPY1]], [[COPY2]], [[V_MOV_B32_e32_11]], 0, 0, 0, implicit $mode, implicit $exec
@@ -434,15 +435,15 @@ define amdgpu_kernel void @test_spill_cost_reset(
   ; CHECK-NEXT:   [[COPY96:%[0-9]+]]:vreg_64_align2 = nofpexcept V_PK_ADD_F32 8, [[COPY96]], 8, [[COPY96]], 0, 0, 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[COPY95:%[0-9]+]]:vreg_64_align2 = nofpexcept V_PK_ADD_F32 8, [[COPY95]], 8, [[COPY95]], 0, 0, 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[COPY94:%[0-9]+]]:vreg_64_align2 = nofpexcept V_PK_ADD_F32 8, [[COPY94]], 8, [[COPY94]], 0, 0, 0, 0, 0, implicit $mode, implicit $exec
+  ; CHECK-NEXT:   [[V_MFMA_F32_16X16X32_F16_e64_:%[0-9]+]]:areg_128_align2 = V_MFMA_F32_16X16X32_F16_e64 [[COPY3]], [[COPY4]], [[COPY132]], 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[COPY93:%[0-9]+]]:vreg_64_align2 = nofpexcept V_PK_ADD_F32 8, [[COPY93]], 8, [[COPY93]], 0, 0, 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[COPY92:%[0-9]+]]:vreg_64_align2 = nofpexcept V_PK_ADD_F32 8, [[COPY92]], 8, [[COPY92]], 0, 0, 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[COPY91:%[0-9]+]]:vreg_64_align2 = nofpexcept V_PK_ADD_F32 8, [[COPY91]], 8, [[COPY91]], 0, 0, 0, 0, 0, implicit $mode, implicit $exec
-  ; CHECK-NEXT:   [[V_MFMA_F32_16X16X32_F16_vgprcd_e64_:%[0-9]+]]:vreg_128_align2 = V_MFMA_F32_16X16X32_F16_vgprcd_e64 [[COPY3]], [[COPY4]], [[V_MOV_B32_e32_12]], 0, 0, 0, implicit $mode, implicit $exec
-  ; CHECK-NEXT:   [[V_MFMA_F32_16X16X32_F16_vgprcd_e64_1:%[0-9]+]]:vreg_128_align2 = V_MFMA_F32_16X16X32_F16_vgprcd_e64 [[COPY1]], [[COPY2]], [[V_MFMA_F32_16X16X32_F16_vgprcd_e64_]], 0, 0, 0, implicit $mode, implicit $exec
+  ; CHECK-NEXT:   [[V_MFMA_F32_16X16X32_F16_e64_1:%[0-9]+]]:areg_128_align2 = V_MFMA_F32_16X16X32_F16_e64 [[COPY1]], [[COPY2]], [[V_MFMA_F32_16X16X32_F16_e64_]], 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[COPY90:%[0-9]+]]:vreg_64_align2 = nofpexcept V_PK_ADD_F32 8, [[COPY90]], 8, [[COPY90]], 0, 0, 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[COPY89:%[0-9]+]]:vreg_64_align2 = nofpexcept V_PK_ADD_F32 8, [[COPY89]], 8, [[COPY89]], 0, 0, 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[COPY88:%[0-9]+]]:vreg_64_align2 = nofpexcept V_PK_ADD_F32 8, [[COPY88]], 8, [[COPY88]], 0, 0, 0, 0, 0, implicit $mode, implicit $exec
-  ; CHECK-NEXT:   [[V_MFMA_F32_16X16X32_F16_vgprcd_e64_2:%[0-9]+]]:vreg_128_align2 = V_MFMA_F32_16X16X32_F16_vgprcd_e64 [[COPY3]], [[COPY4]], [[V_MFMA_F32_16X16X32_F16_vgprcd_e64_1]], 0, 0, 0, implicit $mode, implicit $exec
+  ; CHECK-NEXT:   [[V_MFMA_F32_16X16X32_F16_e64_2:%[0-9]+]]:areg_128_align2 = V_MFMA_F32_16X16X32_F16_e64 [[COPY3]], [[COPY4]], [[V_MFMA_F32_16X16X32_F16_e64_1]], 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[COPY87:%[0-9]+]]:vreg_64_align2 = nofpexcept V_PK_ADD_F32 8, [[COPY87]], 8, [[COPY87]], 0, 0, 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[COPY86:%[0-9]+]]:vreg_64_align2 = nofpexcept V_PK_ADD_F32 8, [[COPY86]], 8, [[COPY86]], 0, 0, 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[COPY85:%[0-9]+]]:vreg_64_align2 = nofpexcept V_PK_ADD_F32 8, [[COPY85]], 8, [[COPY85]], 0, 0, 0, 0, 0, implicit $mode, implicit $exec
@@ -535,7 +536,7 @@ define amdgpu_kernel void @test_spill_cost_reset(
   ; CHECK-NEXT: bb.2.epilogue:
   ; CHECK-NEXT:   [[S_LOAD_DWORDX2_IMM:%[0-9]+]]:sreg_64_xexec_xnull = S_LOAD_DWORDX2_IMM [[COPY]](p4), 0, 0 :: (invariant load (s64) from %ir.out.kernarg.offset550, align 16, addrspace 4)
   ; CHECK-NEXT:   [[V_MOV_B32_e32_13:%[0-9]+]]:vgpr_32 = V_MOV_B32_e32 0, implicit $exec
-  ; CHECK-NEXT:   GLOBAL_STORE_DWORD_SADDR [[V_MOV_B32_e32_13]], [[V_MFMA_F32_16X16X32_F16_vgprcd_e64_2]].sub0, [[S_LOAD_DWORDX2_IMM]], 0, 0, implicit $exec :: (store (s32) into %ir.out.load, addrspace 1)
+  ; CHECK-NEXT:   GLOBAL_STORE_DWORD_SADDR [[V_MOV_B32_e32_13]], [[V_MFMA_F32_16X16X32_F16_e64_2]].sub0, [[S_LOAD_DWORDX2_IMM]], 0, 0, implicit $exec :: (store (s32) into %ir.out.load, addrspace 1)
   ; CHECK-NEXT:   S_ENDPGM 0
     ptr addrspace(1) %out,
     <8 x half> %a0, <8 x half> %a1,
