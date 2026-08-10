@@ -21,6 +21,20 @@ using namespace llvm::AMDGPU;
 
 #define DEBUG_TYPE "machine-scheduler"
 
+enum class KillProximityMode { Off, Auto, Always };
+
+static cl::opt<KillProximityMode> CoexecKillProximity(
+    "amdgpu-coexec-kill-proximity", cl::Hidden,
+    cl::init(KillProximityMode::Auto),
+    cl::desc("Tiebreak in tryCriticalResource by preferring candidates closer "
+             "to killing a register (lower min NumSuccsLeft)."),
+    cl::values(
+        clEnumValN(KillProximityMode::Off, "off", "Disabled."),
+        clEnumValN(KillProximityMode::Auto, "auto",
+                   "Enabled when HighPressure is set."),
+        clEnumValN(KillProximityMode::Always, "always",
+                   "Always enabled.")));
+
 namespace {
 
 // Used to disable post-RA scheduling with function level granularity.
@@ -732,6 +746,113 @@ bool CandidateHeuristics::tryCriticalResourceDependency(
   return false;
 }
 
+// Kill proximity: prefer the candidate which kills a register or gets us
+// closer to killing a register.
+// Compares minimum unscheduled data successors across data predecessors,
+// considers 1 unscheduled data successor as a kill.
+static bool tryKillProximity(GenericSchedulerBase::SchedCandidate &Cand,
+                             GenericSchedulerBase::SchedCandidate &TryCand,
+                             bool NeedKillProximity) {
+  if (CoexecKillProximity == KillProximityMode::Off)
+    return false;
+  if (CoexecKillProximity == KillProximityMode::Auto && !NeedKillProximity)
+    return false;
+
+  // Skip memory operations -- they unlikely to reduce pressure.
+  const MachineInstr *TryMI = TryCand.SU->getInstr();
+  const MachineInstr *CandMI = Cand.SU->getInstr();
+  if (SIInstrInfo::isDS(*TryMI) || SIInstrInfo::isDS(*CandMI) ||
+      SIInstrInfo::isFLAT(*TryMI) || SIInstrInfo::isFLAT(*CandMI) ||
+      SIInstrInfo::isVMEM(*TryMI) || SIInstrInfo::isVMEM(*CandMI))
+    return false;
+
+  // Estimate number of killed registers and min successors left for killing.
+  auto getKillStats = [](const SUnit *SU) {
+    // Group predecessor edges by base register to avoid counting subreg kills
+    // as several real kills.
+    SmallDenseMap<Register, int, 8> RegMaxUnsched;
+
+    for (const SDep &Pred : SU->Preds) {
+      if (Pred.getKind() != SDep::Data)
+        continue;
+      Register Reg = Pred.getReg();
+      if (!Reg)
+        continue;
+      const SUnit *PredSU = Pred.getSUnit();
+      int Unscheduled = 0;
+      for (const SDep &Succ : PredSU->Succs)
+        if (Succ.getKind() == SDep::Data && !Succ.getSUnit()->isScheduled)
+          ++Unscheduled;
+
+      LLVM_DEBUG({
+        dbgs() << "        pred SU(" << PredSU->NodeNum
+               << ") reg=" << printReg(Reg) << " unschedSuccs=" << Unscheduled
+               << " ";
+        if (PredSU->getInstr())
+          PredSU->getInstr()->print(dbgs(), /*IsStandalone=*/true,
+                                    /*SkipOpers=*/false, /*SkipDebugLoc=*/true);
+        else
+          dbgs() << "<no instr>";
+        dbgs() << "\n";
+      });
+      // Take the max across all producers of the same register.
+      // Consider the register is killed when all its producers have few
+      // unscheduled successors.
+      RegMaxUnsched[Reg] = std::max(RegMaxUnsched[Reg], Unscheduled);
+    }
+
+    int Kills = 0;
+    int MinOther = RegMaxUnsched.empty()
+                       ? 0
+                       : RegMaxUnsched.begin()->second;
+    for (auto &[Reg, MaxUnsched] : RegMaxUnsched) {
+      if (MaxUnsched < 2)
+        ++Kills;
+      else
+        MinOther = std::min(MinOther, MaxUnsched);
+    }
+    LLVM_DEBUG(dbgs() << "        => kills=" << Kills
+                      << " minOther=" << MinOther
+                      << " (regs=" << RegMaxUnsched.size() << ")\n");
+    return std::pair(Kills, MinOther);
+  };
+
+  LLVM_DEBUG(dbgs() << "      TryCand SU(" << TryCand.SU->NodeNum
+                    << ") preds:\n");
+  auto [TryKills, TryMinOther] = getKillStats(TryCand.SU);
+  LLVM_DEBUG(dbgs() << "      Cand SU(" << Cand.SU->NodeNum << ") preds:\n");
+  auto [CandKills, CandMinOther] = getKillStats(Cand.SU);
+
+  LLVM_DEBUG(dbgs() << "    KillProximity: SU(" << TryCand.SU->NodeNum
+                    << ") kills=" << TryKills << " minOther=" << TryMinOther
+                    << ", SU(" << Cand.SU->NodeNum << ") kills=" << CandKills
+                    << " minOther=" << CandMinOther << "\n");
+
+  // Prefer more kills.
+  if (tryGreater(TryKills, CandKills, TryCand, Cand,
+                 GenericSchedulerBase::RegCritical)) {
+    LLVM_DEBUG(dbgs() << " KillProximity(kills) -> SU("
+                      << (TryCand.Reason != GenericSchedulerBase::NoCand
+                              ? TryCand.SU->NodeNum
+                              : Cand.SU->NodeNum)
+                      << ")\n");
+    return true;
+  }
+
+  // Prefer closer to killing among non-kill preds.
+  if (tryLess(TryMinOther, CandMinOther, TryCand, Cand,
+              GenericSchedulerBase::RegCritical)) {
+    LLVM_DEBUG(dbgs() << " KillProximity(minOther) -> SU("
+                      << (TryCand.Reason != GenericSchedulerBase::NoCand
+                              ? TryCand.SU->NodeNum
+                              : Cand.SU->NodeNum)
+                      << ")\n");
+    return true;
+  }
+
+  return false;
+}
+
 bool CandidateHeuristics::tryCriticalResource(
     GenericSchedulerBase::SchedCandidate &TryCand,
     GenericSchedulerBase::SchedCandidate &Cand, SchedBoundary *Zone) const {
@@ -907,6 +1028,13 @@ void AMDGPUCoExecSchedStrategy::pickNodeFromQueue(
     }
   }
 
+  NeedKillProximity =
+      DAG->isTrackingPressure() &&
+      VGPRPressure + 2 * MaxVGPRPressureInc >= VGPRExcessLimit;
+  LLVM_DEBUG(dbgs() << "NeedKillProximity=" << NeedKillProximity
+                    << " (VGPR=" << VGPRPressure
+                    << " limit=" << VGPRExcessLimit << ")\n");
+
   auto EvaluateQueue = [&](ReadyQueue &Q, bool FromPending) {
     for (SUnit *SU : Q) {
       SchedCandidate TryCand(ZonePolicy);
@@ -991,6 +1119,11 @@ bool AMDGPUCoExecSchedStrategy::tryCandidateCoexec(SchedCandidate &Cand,
     // scheduled in the current cycle.
     if (tryEffectiveStall(Cand, TryCand, *Zone))
       return TryCand.Reason != NoCand;
+
+    if (tryKillProximity(Cand, TryCand, NeedKillProximity)) {
+      LastAMDGPUReason = AMDGPUSchedReason::KillProximity;
+      return TryCand.Reason != NoCand;
+    }
 
     Heurs.sortHWUIResources();
     if (Heurs.tryCriticalResource(TryCand, Cand, Zone)) {

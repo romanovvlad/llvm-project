@@ -29,6 +29,7 @@ constexpr unsigned DS = 16;
 /// than the generic CandReason enum for debugging purposes.
 enum class AMDGPUSchedReason : uint8_t {
   None,
+  KillProximity,       // tryKillProximity chose to free registers sooner
   CritResourceBalance, // tryCriticalResource chose based on resource pressure
   CritResourceDep,     // tryCriticalResourceDependency chose based on enabling
   NUM_REASONS
@@ -38,6 +39,8 @@ inline StringRef getReasonName(AMDGPUSchedReason R) {
   switch (R) {
   case AMDGPUSchedReason::None:
     return "None";
+  case AMDGPUSchedReason::KillProximity:
+    return "KillProximity";
   case AMDGPUSchedReason::CritResourceBalance:
     return "CritResource";
   case AMDGPUSchedReason::CritResourceDep:
@@ -256,6 +259,8 @@ protected:
                          SchedBoundary &Zone);
   AMDGPU::AMDGPUSchedReason LastAMDGPUReason = AMDGPU::AMDGPUSchedReason::None;
   CandidateHeuristics Heurs;
+  /// Per-pick flag indicating kill proximity should be active.
+  bool NeedKillProximity = false;
 
 #ifndef NDEBUG
   void dumpPickSummary(SUnit *SU, bool IsTopNode, SchedCandidate &Cand);

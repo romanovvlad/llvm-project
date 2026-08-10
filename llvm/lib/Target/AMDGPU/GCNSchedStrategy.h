@@ -45,6 +45,10 @@ raw_ostream &operator<<(raw_ostream &OS, const GCNSchedStageID &StageID);
 /// This is a minimal scheduler strategy.  The main difference between this
 /// and the GenericScheduler is that GCNSchedStrategy uses different
 /// heuristics to determine excess/critical pressure sets.
+/// Headroom before VGPRExcessLimit at which pressure tracking / kill
+/// proximity heuristics activate.
+constexpr unsigned MaxVGPRPressureInc = 16;
+
 class GCNSchedStrategy : public GenericScheduler {
 protected:
   SUnit *pickNodeBidirectional(bool &IsTopNode, bool &PickedPending);
