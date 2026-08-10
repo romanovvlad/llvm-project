@@ -31,6 +31,7 @@ enum class AMDGPUSchedReason : uint8_t {
   None,
   Stall,
   MemoryPipeline,
+  KillProximity,       // tryKillProximity chose to free registers sooner
   CritResourceBalance, // tryCriticalResource chose based on resource pressure
   CritResourceDep,     // tryCriticalResourceDependency chose based on enabling
   NUM_REASONS
@@ -44,6 +45,8 @@ inline StringRef getReasonName(AMDGPUSchedReason R) {
     return "Stall";
   case AMDGPUSchedReason::MemoryPipeline:
     return "MemoryPipeline";
+  case AMDGPUSchedReason::KillProximity:
+    return "KillProximity";
   case AMDGPUSchedReason::CritResourceBalance:
     return "CritResource";
   case AMDGPUSchedReason::CritResourceDep:
@@ -316,6 +319,8 @@ class AMDGPUCoExecSchedStrategy final : public GCNSchedStrategy {
 protected:
   AMDGPU::AMDGPUSchedReason LastAMDGPUReason = AMDGPU::AMDGPUSchedReason::None;
   CandidateHeuristics Heurs;
+  /// Per-pick flag indicating kill proximity should be active.
+  bool NeedKillProximity = false;
 
 #ifndef NDEBUG
   void dumpPickSummary(SUnit *SU, bool IsTopNode, SchedCandidate &Cand);
