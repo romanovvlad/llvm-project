@@ -104,6 +104,11 @@ static cl::opt<bool> DisableRewriteMFMAFormSchedStage(
     "amdgpu-disable-rewrite-mfma-form-sched-stage", cl::Hidden,
     cl::desc("Disable rewrite mfma rewrite scheduling stage"), cl::init(true));
 
+static cl::opt<unsigned>
+    MFMAAGPRBudget("amdgpu-mfma-agpr-budget", cl::Hidden,
+                   cl::desc("AGPR budget for per-chain MFMA->AGPR conversion."),
+                   cl::init(210));
+
 namespace {
 
 struct VGPRThresholdParser : public cl::parser<unsigned> {
@@ -1413,6 +1418,56 @@ void RewriteMFMAFormStage::findReachingUses(
   }
 }
 
+/// Identify accumulator chains: groups of MFMAs connected via dst->src2.
+static SmallVector<SmallVector<unsigned, 8>, 16> identifyAccChains(
+    const std::vector<std::pair<MachineInstr *, unsigned>> &Cands,
+    const SIInstrInfo *TII) {
+  DenseMap<Register, unsigned> DstToCand;
+  DenseMap<Register, unsigned> Src2ToCand;
+  for (unsigned I = 0; I < Cands.size(); I++) {
+    DstToCand[Cands[I].first->getOperand(0).getReg()] = I;
+    MachineOperand *Src2 =
+        TII->getNamedOperand(*Cands[I].first, AMDGPU::OpName::src2);
+    if (Src2 && Src2->isReg())
+      Src2ToCand[Src2->getReg()] = I;
+  }
+
+  BitVector Visited(Cands.size());
+  auto walkForward = [&](unsigned Start) {
+    SmallVector<unsigned, 8> Chain;
+    unsigned Cur = Start;
+    while (!Visited[Cur]) {
+      Visited[Cur] = true;
+      Chain.push_back(Cur);
+      auto It = Src2ToCand.find(Cands[Cur].first->getOperand(0).getReg());
+      if (It == Src2ToCand.end() || Visited[It->second])
+        break;
+      Cur = It->second;
+    }
+    return Chain;
+  };
+
+  SmallVector<SmallVector<unsigned, 8>, 16> Chains;
+
+  // Pass 1: linear chains from roots (src2 not produced by a candidate).
+  for (unsigned I = 0; I < Cands.size(); I++) {
+    MachineOperand *Src2 =
+        TII->getNamedOperand(*Cands[I].first, AMDGPU::OpName::src2);
+    if (Src2 && Src2->isReg() && DstToCand.count(Src2->getReg()))
+      continue;
+    Chains.push_back(walkForward(I));
+  }
+
+  // Pass 2: cyclic chains -- enter at any unvisited candidate.
+  for (unsigned I = 0; I < Cands.size(); I++) {
+    if (Visited[I])
+      continue;
+    Chains.push_back(walkForward(I));
+  }
+
+  return Chains;
+}
+
 bool RewriteMFMAFormStage::initGCNSchedStage() {
   // We only need to run this pass if the architecture supports AGPRs.
   // Additionally, we don't use AGPRs at occupancy levels above 1 so there
@@ -1429,17 +1484,70 @@ bool RewriteMFMAFormStage::initGCNSchedStage() {
       RegionsWithExcessArchVGPR[Region] = true;
   }
 
-  if (RegionsWithExcessArchVGPR.none())
-    return false;
-
   TII = ST.getInstrInfo();
   SRI = ST.getRegisterInfo();
+
+  // Collect all convertible MFMAs.
+  std::vector<std::pair<MachineInstr *, unsigned>> AllCands;
+  for (MachineBasicBlock &MBB : MF)
+    for (MachineInstr &MI : MBB)
+      if (isRewriteCandidate(&MI))
+        AllCands.push_back({&MI, MI.getOpcode()});
+
+  if (AllCands.empty())
+    return false;
+
+  // Identify accumulator chains and select profitable ones within budget.
+  auto Chains = identifyAccChains(AllCands, TII);
+  unsigned AGPRBudget = MFMAAGPRBudget;
+  unsigned AGPRUsed = 0;
+
+  SmallPtrSet<MachineInstr *, 32> AcceptedSet;
+  unsigned AcceptedChains = 0;
+
+  // Sort chains by size (larger chains = more in-loop links = more benefit).
+  SmallVector<unsigned, 16> ChainOrder;
+  for (unsigned C = 0; C < Chains.size(); C++)
+    ChainOrder.push_back(C);
+  llvm::sort(ChainOrder, [&](unsigned A, unsigned B) {
+    return Chains[A].size() > Chains[B].size();
+  });
+
+  for (unsigned C : ChainOrder) {
+    const auto &Chain = Chains[C];
+    if (Chain.size() < 2)
+      continue;
+
+    MachineInstr *First = AllCands[Chain[0]].first;
+    Register DstReg = First->getOperand(0).getReg();
+    const TargetRegisterClass *RC = DAG.MRI.getRegClass(DstReg);
+    unsigned RegSize = SRI->getRegSizeInBits(*RC) / 32;
+
+    if (AGPRUsed + RegSize > AGPRBudget)
+      continue;
+    AGPRUsed += RegSize;
+    AcceptedChains++;
+    for (unsigned Idx : Chain)
+      AcceptedSet.insert(AllCands[Idx].first);
+  }
+
+  LLVM_DEBUG(dbgs() << "RewriteMFMA: " << AcceptedChains << "/"
+                    << Chains.size() << " chains, "
+                    << AcceptedSet.size() << "/" << AllCands.size()
+                    << " MFMAs, " << AGPRUsed << "/" << AGPRBudget
+                    << " AGPRs\n");
+
+  if (AcceptedSet.empty()) {
+    if (RegionsWithExcessArchVGPR.none())
+      return false;
+  }
 
   std::vector<std::pair<MachineInstr *, unsigned>> RewriteCands;
   DenseMap<MachineBasicBlock *, std::set<Register>> CopyForUse;
   SmallPtrSet<MachineInstr *, 8> CopyForDef;
 
-  if (!initHeuristics(RewriteCands, CopyForUse, CopyForDef))
+  if (!initHeuristics(RewriteCands, CopyForUse, CopyForDef,
+                      AcceptedSet.empty() ? nullptr : &AcceptedSet))
     return false;
 
   // TODO: restore cost heuristic once the cost model accounts for all copies.
@@ -2513,7 +2621,8 @@ bool RewriteMFMAFormStage::isRewriteCandidate(MachineInstr *MI) const {
 bool RewriteMFMAFormStage::initHeuristics(
     std::vector<std::pair<MachineInstr *, unsigned>> &RewriteCands,
     DenseMap<MachineBasicBlock *, std::set<Register>> &CopyForUse,
-    SmallPtrSetImpl<MachineInstr *> &CopyForDef) {
+    SmallPtrSetImpl<MachineInstr *> &CopyForDef,
+    const SmallPtrSetImpl<MachineInstr *> *Filter) {
   bool Changed = false;
 
   LLVM_DEBUG(dbgs() << "\n===== RewriteMFMAFormStage::initHeuristics for "
@@ -2522,6 +2631,7 @@ bool RewriteMFMAFormStage::initHeuristics(
 
   // Collect the candidate group, its members share AGPR-form operands
   // post-rewrite, so reaching defs feeding any member don't need bridge copy.
+  // When Filter is set, only include accepted MFMAs.
   SmallPtrSet<MachineInstr *, 16> RewriteSet;
   DenseSet<Register> CandSrc2Regs;
   for (MachineBasicBlock &MBB : MF) {
@@ -2530,6 +2640,8 @@ bool RewriteMFMAFormStage::initHeuristics(
         continue;
       // Reject candidates whose dst has a def that can't produce AGPR
       // (e.g. V_ADD_U32 defining a subreg of the accumulator register).
+      if (Filter && !Filter->contains(&MI))
+        continue;
       if (hasDefRequiringVGPR(MI.getOperand(0).getReg())) {
         LLVM_DEBUG(dbgs() << "  -> REJECTED (dst has def requiring VGPR): "
                           << MI);
