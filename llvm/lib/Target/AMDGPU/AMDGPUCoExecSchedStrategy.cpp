@@ -21,6 +21,19 @@ using namespace llvm::AMDGPU;
 
 #define DEBUG_TYPE "machine-scheduler"
 
+enum class KillProximityMode { Off, Auto, Always };
+
+static cl::opt<KillProximityMode> CoexecKillProximity(
+    "amdgpu-coexec-kill-proximity", cl::Hidden,
+    cl::init(KillProximityMode::Auto),
+    cl::desc("Prioritize instructions which are expected to kill a register "
+             "sooner (lower min NumSuccsLeft)."),
+    cl::values(clEnumValN(KillProximityMode::Off, "off", "Disabled."),
+               clEnumValN(KillProximityMode::Auto, "auto",
+                          "Enabled when HighPressure is set."),
+               clEnumValN(KillProximityMode::Always, "always",
+                          "Always enabled.")));
+
 namespace {
 
 // Used to disable post-RA scheduling with function level granularity.
@@ -442,32 +455,135 @@ SUnit *HardwareUnitInfo::getNextTargetSU(bool LookDeep) const {
   return TargetSU;
 }
 
-void HardwareUnitInfo::insert(SUnit *SU, unsigned BlockingCycles) {
+int HardwareUnitInfo::compareDepth(SUnit *Candidate, SUnit *Existing) const {
+  const unsigned CurDepth = Existing->getDepth();
+  const unsigned CandDepth = Candidate->getDepth();
+
+  if (CandDepth > CurDepth)
+    return -1;
+  if (CandDepth == CurDepth)
+    return 0;
+  return 1;
+}
+
+int HardwareUnitInfo::compareKillProximity(SUnit *Candidate,
+                                           SUnit *Existing) const {
+  // FIXME: original tryKillProximity implementation ignored a bunch of
+  //        different instruction kinds (DS, FLAT, VMEM), but here we consider
+   //        them all. Do we want to address this?
+
+  // Estimate number of killed registers and min successors left for killing.
+  auto getKillStats = [](const SUnit *SU) {
+    // Group predecessor edges by base register to avoid counting subreg kills
+    // as several real kills.
+    SmallDenseMap<Register, unsigned, 8> RegMaxUnsched;
+
+    for (const SDep &Pred : SU->Preds) {
+      if (Pred.getKind() != SDep::Data)
+        continue;
+      Register Reg = Pred.getReg();
+      if (!Reg)
+        continue;
+      const SUnit *PredSU = Pred.getSUnit();
+      unsigned Unscheduled = 0;
+      for (const SDep &Succ : PredSU->Succs)
+        if (Succ.getKind() == SDep::Data && !Succ.getSUnit()->isScheduled)
+          ++Unscheduled;
+
+      LLVM_DEBUG({
+        dbgs() << "        pred SU(" << PredSU->NodeNum
+               << ") reg=" << printReg(Reg) << " unschedSuccs=" << Unscheduled
+               << " ";
+        if (PredSU->getInstr())
+          PredSU->getInstr()->print(dbgs(), /*IsStandalone=*/true,
+                                    /*SkipOpers=*/false, /*SkipDebugLoc=*/true);
+        else
+          dbgs() << "<no instr>";
+        dbgs() << "\n";
+      });
+      // Take the max across all producers of the same register.
+      // Consider the register is killed when all its producers have few
+      // unscheduled successors.
+      RegMaxUnsched[Reg] = std::max(RegMaxUnsched[Reg], Unscheduled);
+    }
+
+    unsigned Kills = 0;
+    unsigned MinOther = RegMaxUnsched.empty()
+                       ? 0
+                       : RegMaxUnsched.begin()->second;
+    for (auto &[Reg, MaxUnsched] : RegMaxUnsched) {
+      if (MaxUnsched < 2)
+        ++Kills;
+      else
+        MinOther = std::min(MinOther, MaxUnsched);
+    }
+    LLVM_DEBUG(dbgs() << "        => kills=" << Kills
+                      << " minOther=" << MinOther
+                      << " (regs=" << RegMaxUnsched.size() << ")\n");
+    return std::pair(Kills, MinOther);
+  };
+
+  auto [CurKills, CurMinOther] = getKillStats(Existing);
+  auto [CandKills, CandMinOther] = getKillStats(Candidate);
+
+  // We first look at how many registers each SU is expected to free.
+  if (CandKills > CurKills)
+    return 1;
+  if (CandKills < CurKills)
+    return -1;
+
+  // If equal, prefer closer to killing among non-kill preds.
+  if (CandMinOther < CurMinOther) {
+    // TODO: I (alsachko) wonder if this would cause to complete rebuild of
+    //       PrioritySUs way too often due to way too small differences.
+    return 1;
+  }
+  if (CandMinOther > CurMinOther)
+    return -1;
+  return 0;
+}
+
+void HardwareUnitInfo::updatePrioritySUsWith(SUnit *Cand,
+                                             bool NeedKillProximity) {
+  if (PrioritySUs.empty()) {
+    PrioritySUs.insert(Cand);
+    return;
+  }
+
+  int Decision = 0;
+
+  SUnit *Existing = *PrioritySUs.begin();
+  if (CoexecKillProximity == KillProximityMode::Off ||
+      (CoexecKillProximity == KillProximityMode::Auto && !NeedKillProximity))
+    Decision = compareDepth(Cand, Existing);
+  else
+    Decision = compareKillProximity(Cand, Existing);
+
+  if (Decision < 0) // Candidate is worse than what we have
+    return;
+
+  if (Decision == 0) { // Candidate is on par with what we have
+    PrioritySUs.insert(Cand);
+    return;
+  }
+
+  // Decision > 0, candidate is better than what we have
+  PrioritySUs.clear();
+  PrioritySUs.insert(Cand);
+}
+
+void HardwareUnitInfo::insert(SUnit *SU, unsigned BlockingCycles,
+                              bool NeedKillProximity) {
   if (!AllSUs.insert(SU))
     llvm_unreachable("HardwareUnit already contains SU!");
 
   TotalCycles += BlockingCycles;
 
-  if (PrioritySUs.empty()) {
-    PrioritySUs.insert(SU);
-    return;
-  }
-  unsigned SUDepth = SU->getDepth();
-  unsigned CurrDepth = (*PrioritySUs.begin())->getDepth();
-  if (SUDepth > CurrDepth)
-    return;
-
-  if (SUDepth == CurrDepth) {
-    PrioritySUs.insert(SU);
-    return;
-  }
-
-  // SU is lower depth and should be prioritized.
-  PrioritySUs.clear();
-  PrioritySUs.insert(SU);
+  updatePrioritySUsWith(SU, NeedKillProximity);
 }
 
-void HardwareUnitInfo::markScheduled(SUnit *SU, unsigned BlockingCycles) {
+void HardwareUnitInfo::markScheduled(SUnit *SU, unsigned BlockingCycles,
+                                     bool NeedKillProximity) {
   // We may want to ignore some HWUIs (e.g. InstructionFlavor::Other). To do so,
   // we just clear the HWUI. However, we still have instructions which map to
   // this HWUI. Don't bother managing the state for these HWUI.
@@ -487,23 +603,7 @@ void HardwareUnitInfo::markScheduled(SUnit *SU, unsigned BlockingCycles) {
     return;
   if (PrioritySUs.empty()) {
     for (auto SU : AllSUs) {
-      if (PrioritySUs.empty()) {
-        PrioritySUs.insert(SU);
-        continue;
-      }
-      unsigned SUDepth = SU->getDepth();
-      unsigned CurrDepth = (*PrioritySUs.begin())->getDepth();
-      if (SUDepth > CurrDepth)
-        continue;
-
-      if (SUDepth == CurrDepth) {
-        PrioritySUs.insert(SU);
-        continue;
-      }
-
-      // SU is lower depth and should be prioritized.
-      PrioritySUs.clear();
-      PrioritySUs.insert(SU);
+      updatePrioritySUsWith(SU, NeedKillProximity);
     }
   }
 }
@@ -564,7 +664,7 @@ void CandidateHeuristics::updateForScheduling(SUnit *SU) {
   HardwareUnitInfo *HWUI =
       getHWUIFromFlavor(classifyFlavor(*SU->getInstr(), *SII));
   assert(HWUI);
-  HWUI->markScheduled(SU, getHWUICyclesForInst(SU));
+  HWUI->markScheduled(SU, getHWUICyclesForInst(SU), NeedKillProximity);
 }
 
 void CandidateHeuristics::initialize(ScheduleDAGMI *SchedDAG,
@@ -598,7 +698,8 @@ void CandidateHeuristics::collectHWUIPressure() {
 
   for (auto &SU : DAG->SUnits) {
     const InstructionFlavor Flavor = classifyFlavor(*SU.getInstr(), *SII);
-    HWUInfo[(int)(Flavor)].insert(&SU, getHWUICyclesForInst(&SU));
+    HWUInfo[(int)(Flavor)].insert(&SU, getHWUICyclesForInst(&SU),
+                                  NeedKillProximity);
   }
 
   for (auto &HWUI : HWUInfo)
@@ -906,6 +1007,14 @@ void AMDGPUCoExecSchedStrategy::pickNodeFromQueue(
       AGPRPressure = DownwardTracker.getPressure().getAGPRNum();
     }
   }
+
+  const bool NeedKillProximity =
+      DAG->isTrackingPressure() &&
+      VGPRPressure + 2 * MaxVGPRPressureInc >= VGPRExcessLimit;
+  LLVM_DEBUG(dbgs() << "NeedKillProximity=" << NeedKillProximity
+                    << " (VGPR=" << VGPRPressure
+                    << " limit=" << VGPRExcessLimit << ")\n");
+  Heurs.setNeedKillProximity(NeedKillProximity);
 
   auto EvaluateQueue = [&](ReadyQueue &Q, bool FromPending) {
     for (SUnit *SU : Q) {

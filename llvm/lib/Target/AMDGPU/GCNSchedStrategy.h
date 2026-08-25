@@ -42,6 +42,10 @@ enum class GCNSchedStageID : unsigned {
 raw_ostream &operator<<(raw_ostream &OS, const GCNSchedStageID &StageID);
 #endif
 
+/// Headroom before VGPRExcessLimit at which pressure tracking / kill
+/// proximity heuristics activate.
+const unsigned MaxVGPRPressureInc = 16;
+
 /// This is a minimal scheduler strategy.  The main difference between this
 /// and the GenericScheduler is that GCNSchedStrategy uses different
 /// heuristics to determine excess/critical pressure sets.
