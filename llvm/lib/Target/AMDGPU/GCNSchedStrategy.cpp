@@ -2537,6 +2537,11 @@ bool RewriteMFMAFormStage::isRecolorSafe(
     // result directly), so it does not constrain the recolor.
     if (isRewriteCandidateMAI(&DefMI, TII, RewriteCandsSet))
       continue;
+    // An MFMA that is a rewrite candidate but NOT in the current set will
+    // stay in VGPR form — it constrains recolor even though canWriteAGPR
+    // would return true.
+    if (TII->isMAI(DefMI) && isRewriteCandidate(&DefMI))
+      return false;
     if (!canWriteAGPR(&DefMI, Reg, RegAGPRClass, TII, SRI))
       return false;
     SmallVector<MachineOperand *, 8> DefReachingUses;
