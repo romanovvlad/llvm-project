@@ -2806,6 +2806,8 @@ int64_t RewriteMFMAFormStage::getRewriteCost(
   unsigned AGPRThreshold = MaxVectorRegs.second;
   unsigned CombinedThreshold = ST.getMaxNumVGPRs(MF);
 
+  unsigned MaxAGPRAfter = 0;
+
   for (unsigned Region = 0; Region < DAG.Regions.size(); Region++) {
     if (!RegionsWithExcessArchVGPR[Region])
       continue;
@@ -2822,6 +2824,8 @@ int64_t RewriteMFMAFormStage::getRewriteCost(
     unsigned SpillCostAfter = PressureAfter.getVGPRSpills(
         MF, ArchVGPRThreshold, AGPRThreshold, CombinedThreshold);
 
+    MaxAGPRAfter = std::max(MaxAGPRAfter, PressureAfter.getAGPRNum());
+
     uint64_t BlockFreq =
         MBFI->getBlockFreq(DAG.Regions[Region].first->getParent())
             .getFrequency();
@@ -2834,7 +2838,7 @@ int64_t RewriteMFMAFormStage::getRewriteCost(
 
     // This assumes perfect spilling / splitting -- using one spill / copy
     // instruction and one restoreFrom / copy for each excess register,
-    int64_t SpillCost = ((int)SpillCostAfter - (int)SpillCostBefore) * 2;
+    int64_t SpillCost = ((int)SpillCostAfter - (int)SpillCostBefore) * 2 * 10;
 
     // Also account for the block frequency.
     if (RelativeFreqIsDenom)
@@ -2883,13 +2887,22 @@ int64_t RewriteMFMAFormStage::getRewriteCost(
     }
   }
 
+  // Reward AGPR utilization: each AGPR used below a soft limit gets a small
+  // bonus. This breaks ties between profitable probes in favor of higher AGPR
+  // utilization, but never overrides a spill cost difference. The soft limit
+  // leaves headroom for regalloc (7/8 of the hard threshold).
+  int64_t AGPRBonus = 0;
+  unsigned AGPRSoftLimit = AGPRThreshold * 7 / 8;
+  if (AGPRSoftLimit > 0 && MaxAGPRAfter <= AGPRSoftLimit)
+    AGPRBonus = -static_cast<int64_t>(MaxAGPRAfter) * 4;
+
   // Reset the classes that were changed to AGPR for better register bank
   // analysis. We must do rewriting after copy-insertion, as some defs of the
   // register may require VGPR.  Additionally, if we bail out and don't perform
   // the rewrite then these need to be restored anyway.
   resetRewriteCandsToVGPR(RewriteCands);
 
-  return Cost + CopyCost;
+  return Cost + CopyCost + AGPRBonus;
 }
 
 bool RewriteMFMAFormStage::rewrite(
