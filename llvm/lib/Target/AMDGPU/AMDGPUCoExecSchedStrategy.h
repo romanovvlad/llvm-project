@@ -109,16 +109,17 @@ private:
   ///           1, if \p Candidate is better than \p Existing
   int compareDepth(SUnit *Candidate, SUnit *Existing) const;
 
-  /// Compares two SUnits to see which one kills a register, or gets us closer
-  /// to killing a register.
+  /// Compares two SUnits to see which one frees a register, or gets us closer
+  /// to freeing a register.
   /// To do so it compares minimum unscheduled data successors across data
-  /// predecessors, considers 1 unscheduled data successor as a kill.
+  /// predecessors, considers 1 unscheduled data successor as freeing a
+  /// register.
   ///
   /// Works like the spaceship operator (<=>), i.e.:
   /// \returns -1, if \p Candidate is worse than \p Existing
   ///           0, if \p Candidate and \p Existing are equal
   ///           1, if \p Candidate is better than \p Existing
-  int compareKillProximity(SUnit *Candidate, SUnit *Existing) const;
+  int compareRegFreeProximity(SUnit *Candidate, SUnit *Existing) const;
 
   /// Try to update PrioritySUs with a new \p SU
   void updatePrioritySUsWith(SUnit *SU, bool IsCloseToRegPressureLimit = false);

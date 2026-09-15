@@ -21,17 +21,17 @@ using namespace llvm::AMDGPU;
 
 #define DEBUG_TYPE "machine-scheduler"
 
-enum class KillProximityMode { Off, Auto, Always };
+enum class RegFreeProximityMode { Off, Auto, Always };
 
-static cl::opt<KillProximityMode> CoexecKillProximity(
-    "amdgpu-coexec-kill-proximity", cl::Hidden,
-    cl::init(KillProximityMode::Auto),
-    cl::desc("Prioritize instructions which are expected to kill a register "
+static cl::opt<RegFreeProximityMode> CoexecRegFreeProximity(
+    "amdgpu-coexec-reg-free-proximity", cl::Hidden,
+    cl::init(RegFreeProximityMode::Auto),
+    cl::desc("Prioritize instructions which are expected to free a register "
              "sooner (lower min NumSuccsLeft)."),
-    cl::values(clEnumValN(KillProximityMode::Off, "off", "Disabled."),
-               clEnumValN(KillProximityMode::Auto, "auto",
+    cl::values(clEnumValN(RegFreeProximityMode::Off, "off", "Disabled."),
+               clEnumValN(RegFreeProximityMode::Auto, "auto",
                           "Enabled when HighPressure is set."),
-               clEnumValN(KillProximityMode::Always, "always",
+               clEnumValN(RegFreeProximityMode::Always, "always",
                           "Always enabled.")));
 
 namespace {
@@ -466,7 +466,7 @@ int HardwareUnitInfo::compareDepth(SUnit *Candidate, SUnit *Existing) const {
   return 1;
 }
 
-int HardwareUnitInfo::compareKillProximity(SUnit *Candidate,
+int HardwareUnitInfo::compareRegFreeProximity(SUnit *Candidate,
                                            SUnit *Existing) const {
   const MachineInstr *ExistingMI = Existing->getInstr();
   const MachineInstr *CandMI = Candidate->getInstr();
@@ -486,10 +486,11 @@ int HardwareUnitInfo::compareKillProximity(SUnit *Candidate,
   if (ExistingIsMemOp && CandIsMemOp)
     return compareDepth(Candidate, Existing);
 
-  // Estimate number of killed registers and min successors left for killing.
-  auto getKillStats = [](const SUnit *SU) {
-    // Group predecessor edges by base register to avoid counting subreg kills
-    // as several real kills.
+  // Estimate number of freed egisters and min successors left for freeing a
+  // register.
+  auto getRegStats = [](const SUnit *SU) {
+    // Group predecessor edges by base register to avoid counting subreg frees
+    // as several real frees.
     SmallDenseMap<Register, unsigned, 8> RegMaxUnsched;
 
     for (const SDep &Pred : SU->Preds) {
@@ -516,41 +517,38 @@ int HardwareUnitInfo::compareKillProximity(SUnit *Candidate,
         dbgs() << "\n";
       });
       // Take the max across all producers of the same register.
-      // Consider the register is killed when all its producers have few
+      // Consider the register freed when all its producers have few
       // unscheduled successors.
       RegMaxUnsched[Reg] = std::max(RegMaxUnsched[Reg], Unscheduled);
     }
 
-    unsigned Kills = 0;
+    unsigned Frees = 0;
     unsigned MinOther =
         RegMaxUnsched.empty() ? 0 : RegMaxUnsched.begin()->second;
     for (auto &[Reg, MaxUnsched] : RegMaxUnsched) {
       if (MaxUnsched < 2)
-        ++Kills;
+        ++Frees;
       else
         MinOther = std::min(MinOther, MaxUnsched);
     }
-    LLVM_DEBUG(dbgs() << "        => kills=" << Kills
+    LLVM_DEBUG(dbgs() << "        => frees=" << Frees
                       << " minOther=" << MinOther
                       << " (regs=" << RegMaxUnsched.size() << ")\n");
-    return std::pair(Kills, MinOther);
+    return std::pair(Frees, MinOther);
   };
 
-  auto [CurKills, CurMinOther] = getKillStats(Existing);
-  auto [CandKills, CandMinOther] = getKillStats(Candidate);
+  auto [CurFrees, CurMinOther] = getRegStats(Existing);
+  auto [CandFrees, CandMinOther] = getRegStats(Candidate);
 
   // We first look at how many registers each SU is expected to free.
-  if (CandKills > CurKills)
+  if (CandFrees > CurFrees)
     return 1;
-  if (CandKills < CurKills)
+  if (CandFrees < CurFrees)
     return -1;
 
-  // If equal, prefer closer to killing among non-kill preds.
-  if (CandMinOther < CurMinOther) {
-    // TODO: I (alsachko) wonder if this would cause to complete rebuild of
-    //       PrioritySUs way too often due to way too small differences.
+  // If equal, prefer closer to freeing among non-freeing preds.
+  if (CandMinOther < CurMinOther)
     return 1;
-  }
   if (CandMinOther > CurMinOther)
     return -1;
   return 0;
@@ -566,11 +564,12 @@ void HardwareUnitInfo::updatePrioritySUsWith(SUnit *Cand,
   int Decision = 0;
 
   SUnit *Existing = *PrioritySUs.begin();
-  if (CoexecKillProximity == KillProximityMode::Off ||
-      (CoexecKillProximity == KillProximityMode::Auto && !IsCloseToRegPressureLimit))
+  if (CoexecRegFreeProximity == RegFreeProximityMode::Off ||
+      (CoexecRegFreeProximity == RegFreeProximityMode::Auto &&
+       !IsCloseToRegPressureLimit))
     Decision = compareDepth(Cand, Existing);
   else
-    Decision = compareKillProximity(Cand, Existing);
+    Decision = compareRegFreeProximity(Cand, Existing);
 
   if (Decision < 0) // Candidate is worse than what we have
     return;
@@ -1021,7 +1020,7 @@ void AMDGPUCoExecSchedStrategy::pickNodeFromQueue(
     }
   }
 
-  constexpr MaxVGPRPressureIncFactor = 2; // Empirically chosen
+  constexpr unsigned MaxVGPRPressureIncFactor = 2; // Empirically chosen
   const bool IsCloseToRegPressureLimit =
       DAG->isTrackingPressure() &&
       VGPRPressure + MaxVGPRPressureIncFactor * MaxVGPRPressureInc >=
