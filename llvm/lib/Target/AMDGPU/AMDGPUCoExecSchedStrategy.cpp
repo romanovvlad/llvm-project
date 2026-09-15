@@ -1021,9 +1021,11 @@ void AMDGPUCoExecSchedStrategy::pickNodeFromQueue(
     }
   }
 
+  constexpr MaxVGPRPressureIncFactor = 2; // Empirically chosen
   const bool IsCloseToRegPressureLimit =
       DAG->isTrackingPressure() &&
-      VGPRPressure + 2 * MaxVGPRPressureInc >= VGPRExcessLimit;
+      VGPRPressure + MaxVGPRPressureIncFactor * MaxVGPRPressureInc >=
+          VGPRExcessLimit;
   LLVM_DEBUG(dbgs() << "IsCloseToRegPressureLimit=" << IsCloseToRegPressureLimit
                     << " (VGPR=" << VGPRPressure
                     << " limit=" << VGPRExcessLimit << ")\n");
