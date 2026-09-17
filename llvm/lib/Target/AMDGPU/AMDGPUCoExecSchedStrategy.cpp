@@ -21,6 +21,19 @@ using namespace llvm::AMDGPU;
 
 #define DEBUG_TYPE "machine-scheduler"
 
+enum class RegFreeProximityMode { Off, Auto, Always };
+
+static cl::opt<RegFreeProximityMode> CoexecRegFreeProximity(
+    "amdgpu-coexec-reg-free-proximity", cl::Hidden,
+    cl::init(RegFreeProximityMode::Auto),
+    cl::desc("Prioritize instructions which are expected to free a register "
+             "sooner (lower min NumSuccsLeft)."),
+    cl::values(clEnumValN(RegFreeProximityMode::Off, "off", "Disabled."),
+               clEnumValN(RegFreeProximityMode::Auto, "auto",
+                          "Enabled when HighPressure is set."),
+               clEnumValN(RegFreeProximityMode::Always, "always",
+                          "Always enabled.")));
+
 namespace {
 
 // Used to disable post-RA scheduling with function level granularity.
@@ -442,32 +455,141 @@ SUnit *HardwareUnitInfo::getNextTargetSU(bool LookDeep) const {
   return TargetSU;
 }
 
-void HardwareUnitInfo::insert(SUnit *SU, unsigned BlockingCycles) {
+int HardwareUnitInfo::compareDepth(SUnit *Candidate, SUnit *Existing) const {
+  const unsigned CurDepth = Existing->getDepth();
+  const unsigned CandDepth = Candidate->getDepth();
+
+  if (CandDepth > CurDepth)
+    return -1;
+  if (CandDepth == CurDepth)
+    return 0;
+  return 1;
+}
+
+int HardwareUnitInfo::compareRegFreeProximity(SUnit *Candidate,
+                                              SUnit *Existing) const {
+  const MachineInstr *CandMI = Candidate->getInstr();
+  // Both Candidate and Existing SU belong to the same HW unit and instruction
+  // flavor, meaning that if one is a memory op of some kind, then another is a
+  // memory op of the same kind as well.
+  const bool IsMemOp = SIInstrInfo::isDS(*CandMI) ||
+                       SIInstrInfo::isFLAT(*CandMI) ||
+                       SIInstrInfo::isVMEM(*CandMI);
+  // Memory operation instructions do not generally help reduce register
+  // pressure, hence a number of early exist.
+  if (IsMemOp)
+    return compareDepth(Candidate, Existing);
+
+  // Estimate number of freed egisters and min successors left for freeing a
+  // register.
+  auto getRegStats = [](const SUnit *SU) {
+    // Group predecessor edges by base register to avoid counting subreg frees
+    // as several real frees.
+    SmallDenseMap<Register, unsigned, 8> RegMaxUnsched;
+
+    for (const SDep &Pred : SU->Preds) {
+      if (Pred.getKind() != SDep::Data)
+        continue;
+      Register Reg = Pred.getReg();
+      if (!Reg)
+        continue;
+      const SUnit *PredSU = Pred.getSUnit();
+      unsigned Unscheduled = 0;
+      for (const SDep &Succ : PredSU->Succs)
+        if (Succ.getKind() == SDep::Data && !Succ.getSUnit()->isScheduled)
+          ++Unscheduled;
+
+      LLVM_DEBUG({
+        dbgs() << "        pred SU(" << PredSU->NodeNum
+               << ") reg=" << printReg(Reg) << " unschedSuccs=" << Unscheduled
+               << " ";
+        if (PredSU->getInstr())
+          PredSU->getInstr()->print(dbgs(), /*IsStandalone=*/true,
+                                    /*SkipOpers=*/false, /*SkipDebugLoc=*/true);
+        else
+          dbgs() << "<no instr>";
+        dbgs() << "\n";
+      });
+      // Take the max across all producers of the same register.
+      // Consider the register freed when all its producers have few
+      // unscheduled successors.
+      RegMaxUnsched[Reg] = std::max(RegMaxUnsched[Reg], Unscheduled);
+    }
+
+    unsigned Frees = 0;
+    unsigned MinOther =
+        RegMaxUnsched.empty() ? 0 : RegMaxUnsched.begin()->second;
+    for (auto &[Reg, MaxUnsched] : RegMaxUnsched) {
+      if (MaxUnsched < 2)
+        ++Frees;
+      else
+        MinOther = std::min(MinOther, MaxUnsched);
+    }
+    LLVM_DEBUG(dbgs() << "        => frees=" << Frees
+                      << " minOther=" << MinOther
+                      << " (regs=" << RegMaxUnsched.size() << ")\n");
+    return std::pair(Frees, MinOther);
+  };
+
+  auto [CurFrees, CurMinOther] = getRegStats(Existing);
+  auto [CandFrees, CandMinOther] = getRegStats(Candidate);
+
+  // We first look at how many registers each SU is expected to free.
+  if (CandFrees > CurFrees)
+    return 1;
+  if (CandFrees < CurFrees)
+    return -1;
+
+  // If equal, prefer closer to freeing among non-freeing preds.
+  if (CandMinOther < CurMinOther)
+    return 1;
+  if (CandMinOther > CurMinOther)
+    return -1;
+  return 0;
+}
+
+void HardwareUnitInfo::updatePrioritySUsWith(SUnit *Cand,
+                                             bool IsCloseToRegPressureLimit) {
+  if (PrioritySUs.empty()) {
+    PrioritySUs.insert(Cand);
+    return;
+  }
+
+  int Decision = 0;
+
+  SUnit *Existing = *PrioritySUs.begin();
+  if (CoexecRegFreeProximity == RegFreeProximityMode::Off ||
+      (CoexecRegFreeProximity == RegFreeProximityMode::Auto &&
+       !IsCloseToRegPressureLimit))
+    Decision = compareDepth(Cand, Existing);
+  else
+    Decision = compareRegFreeProximity(Cand, Existing);
+
+  if (Decision < 0) // Candidate is worse than what we have
+    return;
+
+  if (Decision == 0) { // Candidate is on par with what we have
+    PrioritySUs.insert(Cand);
+    return;
+  }
+
+  // Decision > 0, candidate is better than what we have
+  PrioritySUs.clear();
+  PrioritySUs.insert(Cand);
+}
+
+void HardwareUnitInfo::insert(SUnit *SU, unsigned BlockingCycles,
+                              bool IsCloseToRegPressureLimit) {
   if (!AllSUs.insert(SU))
     llvm_unreachable("HardwareUnit already contains SU!");
 
   TotalCycles += BlockingCycles;
 
-  if (PrioritySUs.empty()) {
-    PrioritySUs.insert(SU);
-    return;
-  }
-  unsigned SUDepth = SU->getDepth();
-  unsigned CurrDepth = (*PrioritySUs.begin())->getDepth();
-  if (SUDepth > CurrDepth)
-    return;
-
-  if (SUDepth == CurrDepth) {
-    PrioritySUs.insert(SU);
-    return;
-  }
-
-  // SU is lower depth and should be prioritized.
-  PrioritySUs.clear();
-  PrioritySUs.insert(SU);
+  updatePrioritySUsWith(SU, IsCloseToRegPressureLimit);
 }
 
-void HardwareUnitInfo::markScheduled(SUnit *SU, unsigned BlockingCycles) {
+void HardwareUnitInfo::markScheduled(SUnit *SU, unsigned BlockingCycles,
+                                     bool IsCloseToRegPressureLimit) {
   // We may want to ignore some HWUIs (e.g. InstructionFlavor::Other). To do so,
   // we just clear the HWUI. However, we still have instructions which map to
   // this HWUI. Don't bother managing the state for these HWUI.
@@ -487,23 +609,7 @@ void HardwareUnitInfo::markScheduled(SUnit *SU, unsigned BlockingCycles) {
     return;
   if (PrioritySUs.empty()) {
     for (auto SU : AllSUs) {
-      if (PrioritySUs.empty()) {
-        PrioritySUs.insert(SU);
-        continue;
-      }
-      unsigned SUDepth = SU->getDepth();
-      unsigned CurrDepth = (*PrioritySUs.begin())->getDepth();
-      if (SUDepth > CurrDepth)
-        continue;
-
-      if (SUDepth == CurrDepth) {
-        PrioritySUs.insert(SU);
-        continue;
-      }
-
-      // SU is lower depth and should be prioritized.
-      PrioritySUs.clear();
-      PrioritySUs.insert(SU);
+      updatePrioritySUsWith(SU, IsCloseToRegPressureLimit);
     }
   }
 }
@@ -564,7 +670,7 @@ void CandidateHeuristics::updateForScheduling(SUnit *SU) {
   HardwareUnitInfo *HWUI =
       getHWUIFromFlavor(classifyFlavor(*SU->getInstr(), *SII));
   assert(HWUI);
-  HWUI->markScheduled(SU, getHWUICyclesForInst(SU));
+  HWUI->markScheduled(SU, getHWUICyclesForInst(SU), IsCloseToRegPressureLimit);
 }
 
 void CandidateHeuristics::initialize(ScheduleDAGMI *SchedDAG,
@@ -598,7 +704,8 @@ void CandidateHeuristics::collectHWUIPressure() {
 
   for (auto &SU : DAG->SUnits) {
     const InstructionFlavor Flavor = classifyFlavor(*SU.getInstr(), *SII);
-    HWUInfo[(int)(Flavor)].insert(&SU, getHWUICyclesForInst(&SU));
+    HWUInfo[(int)(Flavor)].insert(&SU, getHWUICyclesForInst(&SU),
+                                  IsCloseToRegPressureLimit);
   }
 
   for (auto &HWUI : HWUInfo)
@@ -906,6 +1013,16 @@ void AMDGPUCoExecSchedStrategy::pickNodeFromQueue(
       AGPRPressure = DownwardTracker.getPressure().getAGPRNum();
     }
   }
+
+  constexpr unsigned MaxVGPRPressureIncFactor = 2; // Empirically chosen
+  const bool IsCloseToRegPressureLimit =
+      DAG->isTrackingPressure() &&
+      VGPRPressure + MaxVGPRPressureIncFactor * MaxVGPRPressureInc >=
+          VGPRExcessLimit;
+  LLVM_DEBUG(dbgs() << "IsCloseToRegPressureLimit=" << IsCloseToRegPressureLimit
+                    << " (VGPR=" << VGPRPressure
+                    << " limit=" << VGPRExcessLimit << ")\n");
+  Heurs.setIsCloseToRegPressureLimit(IsCloseToRegPressureLimit);
 
   auto EvaluateQueue = [&](ReadyQueue &Q, bool FromPending) {
     for (SUnit *SU : Q) {
