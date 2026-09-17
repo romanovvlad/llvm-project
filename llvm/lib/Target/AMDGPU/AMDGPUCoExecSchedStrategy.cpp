@@ -467,23 +467,17 @@ int HardwareUnitInfo::compareDepth(SUnit *Candidate, SUnit *Existing) const {
 }
 
 int HardwareUnitInfo::compareRegFreeProximity(SUnit *Candidate,
-                                           SUnit *Existing) const {
-  const MachineInstr *ExistingMI = Existing->getInstr();
+                                              SUnit *Existing) const {
   const MachineInstr *CandMI = Candidate->getInstr();
-
-  const bool CandIsMemOp = SIInstrInfo::isDS(*CandMI) ||
-                           SIInstrInfo::isFLAT(*CandMI) ||
-                           SIInstrInfo::isVMEM(*CandMI);
-  const bool ExistingIsMemOp = SIInstrInfo::isDS(*ExistingMI) ||
-                               SIInstrInfo::isFLAT(*ExistingMI) ||
-                               SIInstrInfo::isVMEM(*ExistingMI);
+  // Both Candidate and Existing SU belong to the same HW unit and instruction
+  // flavor, meaning that if one is a memory op of some kind, then another is a
+  // memory op of the same kind as well.
+  const bool IsMemOp = SIInstrInfo::isDS(*CandMI) ||
+                       SIInstrInfo::isFLAT(*CandMI) ||
+                       SIInstrInfo::isVMEM(*CandMI);
   // Memory operation instructions do not generally help reduce register
   // pressure, hence a number of early exist.
-  if (!ExistingIsMemOp && CandIsMemOp)
-    return -1;
-  if (ExistingIsMemOp && !CandIsMemOp)
-    return 1;
-  if (ExistingIsMemOp && CandIsMemOp)
+  if (IsMemOp)
     return compareDepth(Candidate, Existing);
 
   // Estimate number of freed egisters and min successors left for freeing a
