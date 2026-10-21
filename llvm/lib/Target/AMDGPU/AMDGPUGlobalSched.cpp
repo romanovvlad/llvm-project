@@ -288,6 +288,11 @@ private:
   void regionsOf(const DepGraph &G, ArrayRef<MachineInstr *> Path,
                  const Timing &T, Regions &R) const;
 
+  /// The chain that leaves the least ordering to do, and in \p Bits how much
+  /// that is.
+  SmallVector<MachineInstr *, 0> spreadPath(const DepGraph &G,
+                                            double &Bits) const;
+
   /// Two ways one region's ordering problem is smaller than its size says.
   /// \p In is everything in that region, in topological order.
   void reduceOf(const DepGraph &G, ArrayRef<MachineInstr *> In, const Timing &T,
@@ -774,6 +779,67 @@ void AMDGPUGlobalSchedImpl::regionsOf(const DepGraph &G,
     for (unsigned I = First; I <= Last; ++I)
       ++R.Count[I];
   }
+}
+
+SmallVector<MachineInstr *, 0>
+AMDGPUGlobalSchedImpl::spreadPath(const DepGraph &G, double &Bits) const {
+  // Regions are a coordinate system, not a commitment. Any chain cuts the
+  // function into regions, every schedule is still describable in the cut, and
+  // so the chain is free to choose. What it is worth choosing for is the
+  // ordering that is left: a region holding k instructions costs log2(k!), and
+  // that is smallest when the steps are spread evenly, not when there are many
+  // of them.
+  //
+  // Which region an instruction is in today is read off how many steps the
+  // order has passed, so a region is exactly a gap between two consecutive
+  // steps in that order, and the cost of a chain is a sum over its edges.
+  // Finding the best one is then a shortest path.
+  //
+  // What does not work is growing a chain by the instructions dependence pins
+  // to a single region. There are none, and there can be none: such an
+  // instruction comes after one step and before the next, which are joined by
+  // an edge, so routing the path through it would make the path longer than
+  // the longest path.
+  const unsigned N = G.Order.size();
+  DenseMap<const MachineInstr *, unsigned> Pos;
+  for (auto [I, MI] : enumerate(G.Order))
+    Pos[MI] = I;
+
+  DenseMap<const MachineInstr *, double> Cost;
+  DenseMap<const MachineInstr *, MachineInstr *> Prev;
+
+  MachineInstr *End = nullptr;
+  Bits = std::numeric_limits<double>::max();
+  for (MachineInstr *MI : G.Order) {
+    // Starting the chain here leaves everything before it in one region.
+    double C = bitsOf(Pos[MI]);
+    MachineInstr *From = nullptr;
+    for (const Dep &P : G.preds(MI)) {
+      auto It = Cost.find(P.Other);
+      if (It == Cost.end())
+        continue;
+      double E = It->second + bitsOf(Pos[MI] - Pos[P.Other] - 1);
+      if (E < C) {
+        C = E;
+        From = P.Other;
+      }
+    }
+    Cost[MI] = C;
+    Prev[MI] = From;
+
+    // And ending it here leaves everything after it in one region.
+    double Full = C + bitsOf(N - 1 - Pos[MI]);
+    if (Full < Bits) {
+      Bits = Full;
+      End = MI;
+    }
+  }
+
+  SmallVector<MachineInstr *, 0> Path;
+  for (MachineInstr *MI = End; MI; MI = Prev.lookup(MI))
+    Path.push_back(MI);
+  std::reverse(Path.begin(), Path.end());
+  return Path;
 }
 
 void AMDGPUGlobalSchedImpl::reduceOf(const DepGraph &G,
@@ -1376,6 +1442,40 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
            << (uint64_t)std::llround(ByCut) << " bits to order them, "
            << (uint64_t)std::llround(Pick) << " to choose which, largest "
            << Worst << " -> " << Hardest << "\n";
+
+    // Cutting a region by position throws schedules away. Cutting the
+    // function by a different chain does not -- a chain is only a coordinate
+    // system -- so the chain is worth choosing for the ordering it leaves
+    // rather than for its length. Measured the same way as above, so the two
+    // numbers can be compared.
+    double SpreadBits = 0;
+    SmallVector<MachineInstr *, 0> BySpread = spreadPath(G, SpreadBits);
+
+    Regions R2;
+    regionsOf(G, BySpread, T, R2);
+
+    unsigned Slots2 = 0;
+    double Place2 = 0, Order2 = 0;
+    SmallVector<unsigned, 0> Busy2(R2.size(), 0);
+    for (const Window &W : R2.Wins) {
+      ++Busy2[W.Here];
+      Slots2 += W.Last - W.First + 1;
+      Place2 += std::log2(W.Last - W.First + 1);
+    }
+    unsigned Worst2 = 0;
+    for (unsigned B : Busy2) {
+      Order2 += bitsOf(B);
+      Worst2 = std::max(Worst2, B);
+    }
+
+    unsigned Num2 = R2.Wins.size();
+    dbgs() << "amdgpu-global-sched: frame: " << BySpread.size()
+           << " on the path, " << Num2 << " left to place, "
+           << (Num2 ? Slots2 / Num2 : 0) << " regions each, "
+           << (uint64_t)std::llround(Place2) << " bits to place, "
+           << (uint64_t)std::llround(Order2) << " to order, "
+           << (uint64_t)std::llround(Place2 + Order2)
+           << " total, largest region " << Worst2 << "\n";
 
     // And what each choice costs. A slot of a region issues at a known cycle,
     // so putting an instruction there has a price that can be read off before
