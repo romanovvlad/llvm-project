@@ -196,13 +196,16 @@ struct Regions {
 /// region is cut again by a path of its own.
 struct Reduction {
   unsigned Insts = 0; ///< instructions in the region
-  unsigned Same = 0;  ///< of them, ones an earlier one already stands for
+  unsigned Same = 0;  ///< of them, ones that cost the same as an earlier one
+  unsigned Twin = 0;  ///< of those, ones an earlier one can really stand for
   unsigned Cut = 0;   ///< pieces left once there is nothing more to cut by
   unsigned Worst = 0; ///< instructions in the biggest piece
-  unsigned Hard = 0;  ///< of those, ones not standing for each other
+  unsigned Hard = 0;  ///< of those, ones no twin covers
   double Bits = 0;    ///< bits to order it now
-  double BySame = 0;  ///< bits once the alike are not reordered
-  double ByCut = 0;   ///< bits once it is cut as well
+  double BySame = 0;  ///< bits once same-cost ones are not reordered
+  double ByTwin = 0;  ///< bits once only the really interchangeable are
+  double ByCut = 0;   ///< bits to order the pieces, twins folded
+  double Pick = 0;    ///< bits to choose a piece, which cutting hides
 };
 
 /// Bits to put \p N things in an order: log2(N!).
@@ -808,16 +811,43 @@ void AMDGPUGlobalSchedImpl::reduceOf(const DepGraph &G,
       Reach[I].set(J);
     }
 
-  // Instructions no schedule can tell apart: the same opcode, so the same
-  // pipes and the same latency; the same earliest and latest cycle, so the
-  // same price at every slot; and unordered against each other, so either may
-  // stand where the other does. Putting k of them in order makes k! schedules
-  // of one cost, and all but one of those is work nobody needs done.
+  // Who each instruction waits for and who waits for it, as a sorted list, so
+  // two of them can be asked whether they stand in exactly the same place in
+  // the graph. The whole graph is used, not the region's part of it: an edge
+  // leaving the region still constrains.
+  auto sigOf = [](ArrayRef<Dep> D) {
+    SmallVector<std::pair<const MachineInstr *, unsigned>, 8> S;
+    for (const Dep &E : D)
+      S.emplace_back(E.Other, E.Latency);
+    llvm::sort(S);
+    return S;
+  };
+  SmallVector<SmallVector<std::pair<const MachineInstr *, unsigned>, 8>, 0> Pre(
+      N),
+      Post(N);
+  for (auto [I, MI] : enumerate(In)) {
+    Pre[I] = sigOf(G.preds(MI));
+    Post[I] = sigOf(G.succs(MI));
+  }
+
+  // Instructions that cost the same wherever they go: the same opcode, so the
+  // same pipes and the same latency; the same earliest and latest cycle, so
+  // the same price at every slot; and unordered against each other. Putting k
+  // of those in order makes k! schedules that the clock cannot tell apart.
   //
-  // This is an equality of time, not of pressure -- two alike instructions
-  // read different registers, so exchanging them does move live ranges. It
-  // bounds how much of the ordering space the timing objective cannot see.
-  auto Alike = [&](ArrayRef<unsigned> Set, unsigned &Same) {
+  // That is not enough to drop k!-1 of them. Costing the same is not the same
+  // as being exchangeable: swapping two of them has to leave a *legal*
+  // schedule, and it only does when they wait for the same instructions and
+  // the same instructions wait for them. Two adds that both become ready at
+  // cycle 4 may do so behind different predecessors, and then the order they
+  // go in is forced by those predecessors, not free.
+  //
+  // So both are counted. \p Same is what the cost model cannot distinguish --
+  // an upper bound on what symmetry could ever remove. \p Twin is what is
+  // really interchangeable, and only that may be removed without putting the
+  // best schedule out of reach.
+  auto Alike = [&](ArrayRef<unsigned> Set, unsigned &Same, unsigned &Twin,
+                   double &TwinBits) {
     DenseMap<std::tuple<unsigned, unsigned, unsigned>, SmallVector<unsigned, 4>>
         ByKind;
     for (unsigned I : Set) {
@@ -845,6 +875,22 @@ void AMDGPUGlobalSchedImpl::reduceOf(const DepGraph &G,
         }
         Saved += bitsOf(Group.size());
         Same += Group.size() - 1;
+
+        // And of that group, the ones that really may change places.
+        SmallVector<unsigned, 8> Open(Group);
+        while (!Open.empty()) {
+          unsigned Head = Open.front();
+          auto *Split =
+              std::stable_partition(Open.begin(), Open.end(), [&](unsigned I) {
+                return Pre[I] == Pre[Head] && Post[I] == Post[Head];
+              });
+          unsigned Size = Split - Open.begin();
+          TwinBits += bitsOf(Size);
+          Twin += Size - 1;
+          SmallVector<unsigned, 8> Keep(Split, Open.end());
+          Open = std::move(Keep);
+        }
+
         Left.assign(Rest.begin(), Rest.end());
       }
     }
@@ -853,7 +899,9 @@ void AMDGPUGlobalSchedImpl::reduceOf(const DepGraph &G,
 
   SmallVector<unsigned, 0> All;
   append_range(All, llvm::seq(0u, N));
-  Out.BySame = Out.Bits - Alike(All, Out.Same);
+  double TwinBits = 0;
+  Out.BySame = Out.Bits - Alike(All, Out.Same, Out.Twin, TwinBits);
+  Out.ByTwin = Out.Bits - TwinBits;
 
   // And the region cuts the same way the function did, and its pieces cut
   // again, for as long as there is anything to cut with. A piece's own longest
@@ -893,10 +941,13 @@ void AMDGPUGlobalSchedImpl::reduceOf(const DepGraph &G,
       }
     }
 
-    // Nothing in here is ordered, so no cut is possible. This is a leaf.
+    // Nothing in here is ordered, so no cut is possible. This is a leaf, and
+    // only the instructions another really can stand for make it smaller.
     if (M < 2 || Deepest == 0) {
-      unsigned Folded = 0;
-      Out.ByCut += bitsOf(M) - Alike(Set, Folded);
+      unsigned Loose = 0, Folded = 0;
+      double Kept = 0;
+      Alike(Set, Loose, Folded, Kept);
+      Out.ByCut += bitsOf(M) - Kept;
       Out.Worst = std::max(Out.Worst, M);
       Out.Hard = std::max(Out.Hard, M - Folded);
       Out.Cut += M != 0;
@@ -908,6 +959,17 @@ void AMDGPUGlobalSchedImpl::reduceOf(const DepGraph &G,
          I = P, P = Prev.lookup(I))
       OnPath.set(I);
 
+    // Which piece an instruction goes in is read off where it sits today, and
+    // that is a choice, not a fact: dependence allows it into every piece
+    // after the last step it waits for and before the first step that waits
+    // for it. Cutting by position explores one piece out of that run and says
+    // nothing about the others, so count what it passed over. Those bits are
+    // not saved -- they move from ordering into placing.
+    SmallVector<unsigned, 0> Steps;
+    for (unsigned I : Set)
+      if (OnPath.test(I))
+        Steps.push_back(I);
+
     SmallVector<SmallVector<unsigned, 0>, 0> Piece(OnPath.count() + 1);
     unsigned Past = 0;
     for (unsigned I : Set) {
@@ -915,6 +977,16 @@ void AMDGPUGlobalSchedImpl::reduceOf(const DepGraph &G,
         ++Past;
         continue;
       }
+      unsigned First = 0, Last = Steps.size();
+      for (auto [K, S] : enumerate(Steps)) {
+        if (Reach[I].test(S)) {
+          Last = K;
+          break;
+        }
+        if (Reach[S].test(I))
+          First = K + 1;
+      }
+      Out.Pick += std::log2(Last - First + 1);
       Piece[Past].push_back(I);
     }
     for (auto &P : Piece)
@@ -1220,8 +1292,8 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
     // whatever order the region is put in.
     uint64_t ByPath = 0, ByPipe = 0;
     unsigned Over = 0;
-    double Same = 0, ByCut = 0;
-    unsigned Alike = 0, Hardest = 0;
+    double Same = 0, Twins = 0, ByCut = 0, Pick = 0;
+    unsigned Alike = 0, Really = 0, Hardest = 0, Pieces = 0;
     for (unsigned I = 0; I < R.size(); ++I) {
       auto [Need, Pipe] = R.floorOf(I);
       ByPath += R.cap(I);
@@ -1236,12 +1308,17 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
       Reduction Red;
       reduceOf(G, Hold[I], T, Red);
       Same += Red.BySame;
+      Twins += Red.ByTwin;
       ByCut += Red.ByCut;
+      Pick += Red.Pick;
       Alike += Red.Same;
+      Really += Red.Twin;
+      Pieces += Red.Cut;
       Hardest = std::max(Hardest, Red.Hard);
       if (Red.Same || Red.Cut > 1)
-        dbgs() << ", " << Red.Same << " alike, cut into " << Red.Cut
-               << " biggest " << Red.Worst << " hard " << Red.Hard;
+        dbgs() << ", " << Red.Same << " alike " << Red.Twin << " really, cut "
+               << "into " << Red.Cut << " biggest " << Red.Worst << " hard "
+               << Red.Hard;
       dbgs() << "\n";
     }
     {
@@ -1283,15 +1360,22 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
            << " total, largest region " << Worst << ", "
            << (uint64_t)std::llround(Narrow) << " bits without a stall\n";
 
-    // The ordering bits that are a real choice. Alike instructions make a
-    // region's factorial bigger without making its schedule any different, and
-    // a region that cuts into pieces is a sum of small factorials instead of
-    // one big one. Neither needs a search to find.
-    dbgs() << "amdgpu-global-sched: reduce: " << (uint64_t)std::llround(Order)
-           << " bits to order, " << Alike << " alike leave "
-           << (uint64_t)std::llround(Same) << ", cutting again leaves "
-           << (uint64_t)std::llround(ByCut) << ", largest region " << Worst
-           << " -> " << Hardest << "\n";
+    // The ordering bits that are a real choice, and what it costs to be sure
+    // of that. Folding instructions that merely cost the same is a guess; only
+    // folding the ones another can really stand for keeps the best schedule
+    // reachable, and it saves far less.
+    dbgs() << "amdgpu-global-sched: alike: " << (uint64_t)std::llround(Order)
+           << " bits to order, " << Alike << " cost the same leave "
+           << (uint64_t)std::llround(Same) << ", " << Really
+           << " really swap leave " << (uint64_t)std::llround(Twins) << "\n";
+
+    // And the cut. The pieces are ordered separately, which is where the big
+    // number goes -- but only once each instruction's piece is fixed, and
+    // fixing it is itself a choice. Those bits are not saved, they move.
+    dbgs() << "amdgpu-global-sched: cut: " << Pieces << " pieces, "
+           << (uint64_t)std::llround(ByCut) << " bits to order them, "
+           << (uint64_t)std::llround(Pick) << " to choose which, largest "
+           << Worst << " -> " << Hardest << "\n";
 
     // And what each choice costs. A slot of a region issues at a known cycle,
     // so putting an instruction there has a price that can be read off before

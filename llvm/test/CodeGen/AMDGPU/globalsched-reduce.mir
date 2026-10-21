@@ -2,30 +2,36 @@
 # RUN:     -debug-only=amdgpu-global-sched -o /dev/null %s 2>&1 | FileCheck %s
 # REQUIRES: asserts
 
-# A region is a much smaller problem than the factorial of its size says, and
-# both of the reasons can be found without searching anything.
+# A region is a smaller problem than the factorial of its size says -- but
+# much less smaller than it first looks, and both of the ways it shrinks have
+# to be checked before they are believed.
 #
-# The first is that some instructions no schedule can tell apart: the same
+# The first is that some instructions cost the same wherever they go: the same
 # opcode, the same earliest and latest cycle, and unordered against each
-# other, so either may stand where the other does. Putting k of them in order
-# makes k! schedules that all cost the same.
+# other. Putting k of those in order makes k! schedules the clock cannot tell
+# apart. That is not a licence to try only one of them. Costing the same is
+# not the same as being exchangeable -- a swap has to leave a schedule that is
+# still legal, and it only does when the two wait for the same instructions
+# and the same instructions wait for them.
 #
-# The second is that a region cuts the way the function did. Its own longest
-# run of instructions that cannot be exchanged is a path, and that path splits
-# the rest of the region into pieces that are ordered separately. The pieces
-# cut again, and again, until what is left has no dependence inside it at all.
-# What survives that is the real unit of the problem.
-#
-# Here one region holds eight instructions -- fifteen bits to order. Four of
-# them are a chain, and cutting by it leaves the other four in a single piece;
-# those four are alike, so there is nothing left to decide at all.
-
-# CHECK: region 2: 8 legal, 8 now, 1 cycles, needs 8 HWVALU, 3 alike, cut into 1 biggest 4 hard 1
-# CHECK: amdgpu-global-sched: search: 22 bits to place, 15 to order, 38 total, largest region 8
-# CHECK: amdgpu-global-sched: reduce: 15 bits to order, 3 alike leave 11, cutting again leaves 0, largest region 8 -> 1
+# The second is that a region cuts the way the function did, by its own
+# longest run of instructions that cannot be exchanged, and the pieces cut
+# again until nothing in a piece is ordered at all. That makes the ordering
+# number collapse -- but only after each instruction's piece is fixed, and
+# fixing it is itself a choice. Those bits are not saved, they move.
 
 ---
-name:            reduce
+
+# Four XORs that cost the same and really are interchangeable: all four wait
+# for the one COPY and all four are waited for by the one S_ENDPGM. The four
+# MULs are a chain, and cutting the region by it leaves the XORs in a single
+# piece with nothing left to decide.
+
+# CHECK: region 2: 8 legal, 8 now, 1 cycles, needs 8 HWVALU, 3 alike 3 really
+# CHECK: amdgpu-global-sched: alike: 15 bits to order, 3 cost the same leave 11, 3 really swap leave 11
+# CHECK: amdgpu-global-sched: cut: 1 pieces, 0 bits to order them, 9 to choose which, largest 8 -> 1
+
+name:            twins
 tracksRegLiveness: true
 body:             |
   bb.0:
@@ -34,13 +40,11 @@ body:             |
     %0:vgpr_32 = COPY $vgpr0
     S_BARRIER
 
-    ; Four that nothing distinguishes.
     %1:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
     %2:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
     %3:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
     %4:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
 
-    ; Four in a row, which is what the region gets cut by.
     %5:vgpr_32 = V_MUL_U32_U24_e32 %0, %0, implicit $exec
     %6:vgpr_32 = V_MUL_U32_U24_e32 %5, %5, implicit $exec
     %7:vgpr_32 = V_MUL_U32_U24_e32 %6, %6, implicit $exec
@@ -55,4 +59,41 @@ body:             |
     %14:vgpr_32 = V_ADD_U32_e32 %13, %13, implicit $exec
 
     S_ENDPGM 0, implicit %1, implicit %2, implicit %3, implicit %4, implicit %8, implicit %14
+...
+---
+
+# The same shape, except each XOR feeds its own MUL. The four XORs still cost
+# the same as each other and are still unordered, and so do the four MULs --
+# but no XOR may take another's place, because a different MUL is waiting for
+# each of them. Eight look alike here and none of them really swap.
+
+# CHECK: amdgpu-global-sched: alike: 15 bits to order, 6 cost the same leave 6, 0 really swap leave 15
+
+name:            looks_alike
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $vgpr0
+
+    %0:vgpr_32 = COPY $vgpr0
+    S_BARRIER
+
+    %1:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %2:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %3:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %4:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+
+    %5:vgpr_32 = V_MUL_U32_U24_e32 %1, %1, implicit $exec
+    %6:vgpr_32 = V_MUL_U32_U24_e32 %2, %2, implicit $exec
+    %7:vgpr_32 = V_MUL_U32_U24_e32 %3, %3, implicit $exec
+    %8:vgpr_32 = V_MUL_U32_U24_e32 %4, %4, implicit $exec
+
+    %9:vgpr_32 = V_ADD_U32_e32 %0, %0, implicit $exec
+    %10:vgpr_32 = V_ADD_U32_e32 %9, %9, implicit $exec
+    %11:vgpr_32 = V_ADD_U32_e32 %10, %10, implicit $exec
+    %12:vgpr_32 = V_ADD_U32_e32 %11, %11, implicit $exec
+    %13:vgpr_32 = V_ADD_U32_e32 %12, %12, implicit $exec
+    %14:vgpr_32 = V_ADD_U32_e32 %13, %13, implicit $exec
+
+    S_ENDPGM 0, implicit %5, implicit %6, implicit %7, implicit %8, implicit %14
 ...
