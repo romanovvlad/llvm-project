@@ -90,6 +90,12 @@ static cl::opt<uint64_t> WindowTotalStepLimit(
     cl::desc("Search nodes the windowed solver may expand across a whole "
              "region before it stops sweeping"));
 
+static cl::opt<bool> SeedFromSpine(
+    "amdgpu-optsched-spine-seed", cl::init(false), cl::Hidden,
+    cl::desc("Start the windowed sweep from the order the region's chain "
+             "decomposition implies, when that order is already cheaper than "
+             "the one the region came in with"));
+
 static cl::opt<bool> AllowPressureIncrease(
     "amdgpu-optsched-allow-pressure-increase", cl::init(false), cl::Hidden,
     cl::desc("Apply a shorter schedule even when it raises register "
@@ -675,6 +681,29 @@ Answer WindowSolver::solve(const Problem &P) {
 
   if (N >= 2 && Width >= 2) {
     Cost BestCost = P.costOf(A.Order);
+
+    // Start from whichever is cheaper, the order the region came in or the one
+    // its chain decomposition implies. The sweep only ever permutes inside a
+    // window, so where it starts bounds how far anything can travel; the
+    // decomposition has already moved every instruction next to the chain it
+    // belongs to, which is a distance no sweep can cover.
+    if (SeedFromSpine) {
+      SmallVector<unsigned, 0> Spine;
+      spineOrder(P, Spine);
+      Cost SpineCost = P.costOf(Spine);
+      // Only when it costs no cycles. The decomposition lays a region out
+      // depth-first -- each chain run to its end before the next is started --
+      // which is the shortest it can make every live range and the least
+      // parallelism it can leave. Measured on the corpus that trade is real in
+      // both directions: it removes spills and it adds memory stalls, and the
+      // stalls are worth more. So the structure is taken for what it is good
+      // at and not allowed to buy registers with time.
+      if (SpineCost < BestCost && SpineCost.Makespan <= BestCost.Makespan) {
+        A.Order = Spine;
+        BestCost = SpineCost;
+        A.Solver = "window(spine seed)";
+      }
+    }
     uint64_t Total = 0;
     bool OutOfBudget = false;
 

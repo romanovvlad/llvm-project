@@ -1,0 +1,72 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 -run-pass=machine-scheduler \
+# RUN:     -misched=amdgpu-optsched -amdgpu-optsched-slot-exact-limit=4 \
+# RUN:     -debug-only=amdgpu-optsched-chain -o /dev/null %s 2>&1 | FileCheck %s
+#
+# REQUIRES: asserts
+
+# One spine is a skeleton, not a decomposition.
+#
+# The region's longest chain cuts it into slots, but on anything real most of
+# the region lands in one slot: the chain is short -- it is long in *cycles*,
+# being a chain of loads -- and everything else hangs off it. On the hot
+# _attn_fwd block, 547 instructions, the chain is 17 and one slot holds 374.
+#
+# A slot is self-contained: if u and v share a slot and u reaches v through w,
+# then w is ordered between them and a slot is a contiguous span of cycles, so
+# w shares the slot too. That makes a slot a region in its own right, with its
+# own longest chain, and cutting it the same way is what turns the skeleton
+# into a decomposition. Recursed, those same 547 instructions come apart into
+# 23 pieces with only 2 above the limit.
+#
+# Here the spine is the load and its use: one cycle of work and eighty of
+# latency, so nothing else comes close. The twelve SALU instructions are four
+# independent three-deep chains, all free, so a single cut drops every one of
+# them into slot 0 and reduces nothing. Cutting that slot peels one chain, and
+# cutting what is left peels the next, until a piece is small enough to
+# enumerate.
+
+# A single cut: twelve of the fourteen instructions in one slot.
+# CHECK: optsched-chain: {{.*}} n=14 chain=2
+# CHECK: optsched-chain:   summary: 3 slots, {{.*}} widest 12 instrs
+
+# Cut the slots too, and nothing is left above the limit.
+# CHECK: optsched-chain:   recursive: depth 4, 1 pieces, 0 still over 4, largest 3
+
+---
+name:            spine_alone_does_not_decompose
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    successors: %bb.1
+    %0:vreg_64_align2 = IMPLICIT_DEF
+    %1:sreg_32 = S_MOV_B32 1
+
+  bb.1:
+    successors: %bb.2
+    ; The spine. Eighty cycles of latency, so no chain of SALU can beat it
+    ; however long it is, and the cut always picks these two.
+    %10:vgpr_32 = GLOBAL_LOAD_DWORD %0, 0, 0, implicit $exec
+    %11:vgpr_32 = V_ADD_U32_e32 %10, %10, implicit $exec
+
+    ; Four three-deep chains, independent of the spine and of each other.
+    ; Nothing orders them against the load, so one cut puts all twelve in the
+    ; slot before it.
+    %20:sreg_32 = S_ADD_I32 %1, %1, implicit-def dead $scc
+    %21:sreg_32 = S_ADD_I32 %20, %20, implicit-def dead $scc
+    %22:sreg_32 = S_ADD_I32 %21, %21, implicit-def dead $scc
+
+    %30:sreg_32 = S_XOR_B32 %1, %1, implicit-def dead $scc
+    %31:sreg_32 = S_XOR_B32 %30, %30, implicit-def dead $scc
+    %32:sreg_32 = S_XOR_B32 %31, %31, implicit-def dead $scc
+
+    %40:sreg_32 = S_OR_B32 %1, %1, implicit-def dead $scc
+    %41:sreg_32 = S_OR_B32 %40, %40, implicit-def dead $scc
+    %42:sreg_32 = S_OR_B32 %41, %41, implicit-def dead $scc
+
+    %50:sreg_32 = S_AND_B32 %1, %1, implicit-def dead $scc
+    %51:sreg_32 = S_AND_B32 %50, %50, implicit-def dead $scc
+    %52:sreg_32 = S_AND_B32 %51, %51, implicit-def dead $scc
+
+  bb.2:
+    S_ENDPGM 0, implicit %11, implicit %22, implicit %32, implicit %42, implicit %52
+...

@@ -290,6 +290,7 @@ Decomposition Decomposition::build(const Problem &P, ArrayRef<unsigned> Order) {
   }
 
   // --- Where the given order puts everything ---------------------------
+  D.Given.assign(Order.begin(), Order.end());
   D.Members.assign(K + 1, {});
   unsigned Seen = 0;
   for (unsigned V : Order) {
@@ -411,6 +412,184 @@ double Decomposition::logOrderingFreedom() const {
 }
 
 //===----------------------------------------------------------------------===//
+// How far the spine idea goes
+//===----------------------------------------------------------------------===//
+//
+// One spine cuts a region into slots, but on a real loop body most of the
+// region lands in a single slot -- the spine is a chain of loads, seventeen
+// instructions long, and the other five hundred hang off it. So the question
+// is whether the same cut applied *inside* a slot keeps working: a slot's
+// members are self-contained, so they are a region in their own right and have
+// their own longest chain.
+//
+// This measures that and nothing else. It reports the sizes of the pieces left
+// when the cut stops reducing them, which is what decides whether a search can
+// be built on it.
+
+namespace {
+/// A subset of a region, cut along its own longest chain.
+struct SubCut {
+  SmallVector<unsigned, 0> Chain;
+  SmallVector<SmallVector<unsigned, 0>, 0> Members; ///< Chain.size()+1 slots.
+};
+} // end anonymous namespace
+
+/// Cut \p Nodes along its longest latency path, using only edges with both
+/// ends inside \p Nodes. Each remaining node goes in the earliest slot it may
+/// legally occupy -- one concrete partition, so the pieces can be counted.
+static SubCut cutAlongSpine(const Problem &P, ArrayRef<unsigned> Nodes) {
+  SubCut C;
+  const unsigned K = Nodes.size();
+  DenseMap<unsigned, unsigned> Local;
+  for (unsigned I = 0; I != K; ++I)
+    Local[Nodes[I]] = I;
+
+  SmallVector<SmallVector<std::pair<unsigned, unsigned>, 4>, 0> Preds(K),
+      Succs(K);
+  SmallVector<SmallVector<unsigned, 4>, 0> AllPreds(K), AllSuccs(K);
+  for (unsigned I = 0; I != K; ++I)
+    for (unsigned EI : P.succEdgesOf(Nodes[I])) {
+      const Edge &E = P.edges()[EI];
+      auto It = Local.find(E.Succ);
+      if (It == Local.end())
+        continue;
+      unsigned J = It->second;
+      AllSuccs[I].push_back(J);
+      AllPreds[J].push_back(I);
+      if (E.Synthetic)
+        continue;
+      Succs[I].push_back({J, E.Latency});
+      Preds[J].push_back({I, E.Latency});
+    }
+
+  SmallVector<unsigned, 0> Depth(K, 0), Height(K, 0);
+  for (unsigned I = 0; I != K; ++I)
+    for (auto [U, L] : Preds[I])
+      Depth[I] = std::max(Depth[I], Depth[U] + L);
+  for (unsigned I = K; I-- > 0;) {
+    Height[I] = P.latencyOf(Nodes[I]);
+    for (auto [V, L] : Succs[I])
+      Height[I] = std::max(Height[I], L + Height[V]);
+  }
+
+  unsigned Peak = 0, Seed = 0;
+  for (unsigned I = 0; I != K; ++I)
+    if (Depth[I] + Height[I] > Peak) {
+      Peak = Depth[I] + Height[I];
+      Seed = I;
+    }
+
+  SmallVector<unsigned, 0> Back;
+  for (unsigned V = Seed;;) {
+    Back.push_back(V);
+    unsigned Prev = ~0u;
+    for (auto [U, L] : Preds[V])
+      if (Depth[V] == Depth[U] + L) {
+        Prev = U;
+        break;
+      }
+    if (Prev == ~0u)
+      break;
+    V = Prev;
+  }
+  SmallVector<unsigned, 0> Spine(Back.rbegin(), Back.rend());
+  for (unsigned V = Seed;;) {
+    unsigned Next = ~0u;
+    for (auto [W, L] : Succs[V])
+      if (Height[V] == L + Height[W]) {
+        Next = W;
+        break;
+      }
+    if (Next == ~0u)
+      break;
+    Spine.push_back(Next);
+    V = Next;
+  }
+
+  SmallVector<unsigned, 0> Idx(K, ~0u);
+  for (auto [S, V] : enumerate(Spine))
+    Idx[V] = S;
+
+  // After[v] is the last spine position reaching v, so v may not go earlier
+  // than the slot after it. Legality, so synthetic edges count here too.
+  SmallVector<unsigned, 0> After(K, ~0u);
+  for (unsigned I = 0; I != K; ++I)
+    for (unsigned U : AllPreds[I]) {
+      unsigned From = Idx[U] != ~0u ? Idx[U] : After[U];
+      if (From != ~0u && (After[I] == ~0u || From > After[I]))
+        After[I] = From;
+    }
+
+  C.Chain.assign(Spine.size(), 0);
+  for (auto [S, V] : enumerate(Spine))
+    C.Chain[S] = Nodes[V];
+  C.Members.assign(Spine.size() + 1, {});
+  for (unsigned I = 0; I != K; ++I) {
+    if (Idx[I] != ~0u)
+      continue;
+    C.Members[After[I] == ~0u ? 0 : After[I] + 1].push_back(Nodes[I]);
+  }
+  return C;
+}
+
+/// Emit \p Nodes in the order the cut implies: everything that belongs before
+/// the first spine instruction, then that instruction, then the next gap, and
+/// so on, with each gap laid out by the same rule.
+static void emitSpineOrder(const Problem &P, ArrayRef<unsigned> Nodes,
+                           unsigned Depth, SmallVectorImpl<unsigned> &Out) {
+  SubCut C;
+  if (Nodes.size() > 1 && Depth < 16) {
+    C = cutAlongSpine(P, Nodes);
+    // A spine of one orders nothing, and the gap would come back whole.
+    if (C.Chain.size() < 2)
+      C.Chain.clear();
+  }
+  if (C.Chain.empty()) {
+    // Node numbers are a topological order, and every list here is built in
+    // increasing node number, so this is legal as it stands.
+    Out.append(Nodes.begin(), Nodes.end());
+    return;
+  }
+  for (unsigned S = 0, K = C.Chain.size(); S <= K; ++S) {
+    emitSpineOrder(P, C.Members[S], Depth + 1, Out);
+    if (S != K)
+      Out.push_back(C.Chain[S]);
+  }
+}
+
+void llvm::AMDGPUOptSched::spineOrder(const Problem &P,
+                                      SmallVectorImpl<unsigned> &Out) {
+  SmallVector<unsigned, 0> All(P.size());
+  for (unsigned V = 0, N = P.size(); V != N; ++V)
+    All[V] = V;
+  Out.clear();
+  Out.reserve(P.size());
+  emitSpineOrder(P, All, 0, Out);
+  assert(Out.size() == P.size() && "spine order lost an instruction");
+}
+
+/// Cut, then cut each piece again, until a piece stops shrinking or is small
+/// enough to enumerate. \p Leaves collects what is left.
+static void cutUntilSmall(const Problem &P, ArrayRef<unsigned> Nodes,
+                          unsigned Small, unsigned Depth, unsigned &MaxDepth,
+                          SmallVectorImpl<SmallVector<unsigned, 0>> &Leaves) {
+  MaxDepth = std::max(MaxDepth, Depth);
+  if (Nodes.size() <= Small || Depth >= 16) {
+    Leaves.push_back(SmallVector<unsigned, 0>(Nodes));
+    return;
+  }
+  SubCut C = cutAlongSpine(P, Nodes);
+  // A spine of one reduces nothing: the piece would come back whole.
+  if (C.Chain.size() < 2) {
+    Leaves.push_back(SmallVector<unsigned, 0>(Nodes));
+    return;
+  }
+  for (ArrayRef<unsigned> M : C.Members)
+    if (!M.empty())
+      cutUntilSmall(P, M, Small, Depth + 1, MaxDepth, Leaves);
+}
+
+//===----------------------------------------------------------------------===//
 // Dumping
 //===----------------------------------------------------------------------===//
 
@@ -496,4 +675,51 @@ void Decomposition::print(raw_ostream &OS, const Problem &P,
      << " empty, " << Exact << " countable exactly, widest " << Widest
      << " instrs; chain " << Length << " of " << SlotLast[K]
      << " cycles, both lower bounds\n";
+
+  // Does the cut keep working when applied to its own output? If the pieces
+  // bottom out small, a search can run inside them; if one piece stays large,
+  // the spine is a view of the region and not a decomposition of it.
+  SmallVector<unsigned, 0> All(P.size());
+  for (unsigned V = 0, N = P.size(); V != N; ++V)
+    All[V] = V;
+  SmallVector<SmallVector<unsigned, 0>, 0> CurPieces;
+  unsigned MaxDepth = 0;
+  cutUntilSmall(P, All, SlotExactLimit, 0, MaxDepth, CurPieces);
+  SmallVector<unsigned, 0> Leaves;
+  for (ArrayRef<unsigned> Pc : CurPieces)
+    Leaves.push_back(Pc.size());
+  llvm::sort(Leaves, std::greater<unsigned>());
+  unsigned Stuck = 0;
+  for (unsigned L : Leaves)
+    if (L > SlotExactLimit)
+      ++Stuck;
+  OS << "optsched-chain:   recursive: depth " << MaxDepth << ", "
+     << Leaves.size() << " pieces, " << Stuck << " still over "
+     << SlotExactLimit << ", largest";
+  for (unsigned I = 0, E = std::min<unsigned>(5, Leaves.size()); I != E; ++I)
+    OS << " " << Leaves[I];
+  OS << "\n";
+
+  // A piece can only be searched as a window if it is already a run of
+  // consecutive positions: the sweep splices a window back where it came from.
+  // So measure how spread out the pieces are in the order the region has.
+  SmallVector<unsigned, 0> Pos(P.size(), 0);
+  for (auto [I, V] : enumerate(Given))
+    Pos[V] = I;
+  unsigned Tight = 0, Total = 0, WorstSpan = 0;
+  for (ArrayRef<unsigned> Pc : CurPieces) {
+    if (Pc.size() < 2)
+      continue;
+    unsigned Lo = ~0u, Hi = 0;
+    for (unsigned V : Pc) {
+      Lo = std::min(Lo, Pos[V]);
+      Hi = std::max(Hi, Pos[V]);
+    }
+    unsigned Span = Hi - Lo + 1;
+    ++Total;
+    Tight += Span == Pc.size();
+    WorstSpan = std::max(WorstSpan, Span - unsigned(Pc.size()));
+  }
+  OS << "optsched-chain:   pieces in this order: " << Tight << " of " << Total
+     << " contiguous, worst spread " << WorstSpan << "\n";
 }

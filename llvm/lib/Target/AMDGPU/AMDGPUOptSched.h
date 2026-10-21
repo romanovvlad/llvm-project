@@ -482,6 +482,7 @@ private:
   SmallVector<unsigned, 0> SlotStart;
   SmallVector<unsigned, 0> SlotLast;
   SmallVector<unsigned, 0> Cycle;
+  SmallVector<unsigned, 0> Given; ///< The order this was measured against.
 };
 
 /// Number of linear extensions of the sub-order \p Nodes induces in \p P.
@@ -492,6 +493,16 @@ private:
 /// largest level set gives a lower one.
 Width countOrders(const Problem &P, ArrayRef<unsigned> Nodes,
                   unsigned ExactLimit);
+
+/// A legal order of the whole region read off the chain decomposition, applied
+/// to itself: the longest chain is laid down first, everything else falls into
+/// the gap it belongs to, and each gap is laid out by the same rule.
+///
+/// A spine is only a skeleton -- on a real loop body one gap holds most of the
+/// region -- so recursing is what turns it into a decomposition. It is a
+/// starting point for a search, not an answer: it says where the dependences
+/// want each instruction, and says nothing about registers.
+void spineOrder(const Problem &P, SmallVectorImpl<unsigned> &Out);
 
 /// How much is actually known about an answer.
 ///
