@@ -100,6 +100,11 @@ static cl::opt<bool>
               cl::desc("Apply a schedule that merely ties the existing one on "
                        "cycles and demand"));
 
+static cl::opt<bool> UseListFloor(
+    "amdgpu-optsched-list-floor", cl::init(true), cl::Hidden,
+    cl::desc("When the chosen solver's answer loses, fall back to the list "
+             "schedule rather than to the order the region arrived in"));
+
 //===----------------------------------------------------------------------===//
 // List scheduling
 //===----------------------------------------------------------------------===//
@@ -1029,13 +1034,16 @@ void OptSchedStrategy::initialize(ScheduleDAGMI *DAGMI) {
   // a time, which is the same search asked a question it can finish. List
   // scheduling is what is left when even that is turned off.
   std::unique_ptr<Solver> S;
-  if (P.size() <= ExactNodeLimit)
+  bool SolverIsList = false;
+  if (P.size() <= ExactNodeLimit) {
     S = createExactSolver(ExactNodeLimit, ExactStepLimit);
-  else if (WindowWidth >= 2)
+  } else if (WindowWidth >= 2) {
     S = createWindowSolver(WindowWidth, WindowPasses, WindowStepLimit,
                            WindowTotalStepLimit);
-  else
+  } else {
     S = createListSolver();
+    SolverIsList = true;
+  }
   Answer A = S->solve(P);
 
   LLVM_DEBUG(dbgs() << "optsched: " << P.Name << " n=" << P.size()
@@ -1043,101 +1051,137 @@ void OptSchedStrategy::initialize(ScheduleDAGMI *DAGMI) {
                     << " status=" << toString(A.St) << " makespan="
                     << A.Makespan << " (source " << SourceMakespan << ")\n");
 
-  if (Error E = verify(P, A)) {
-    ++NumUnverified;
-    LLVM_DEBUG(dbgs() << "optsched: rejected, " << toStringWithoutConsuming(E)
-                      << "; keeping the existing order\n");
-    consumeError(std::move(E));
-    return;
-  }
-  if (A.St == Status::Optimal)
-    ++NumProved;
+  // The order we are holding, and what it costs. Both move if an answer is
+  // adopted: a second answer is then measured against what we already have,
+  // not against what the region arrived with.
+  unsigned CurMakespan = SourceMakespan;
 
-  // Strictly better, not merely as good. An equal-cost reorder buys nothing
-  // and bets the whole region on our model being complete, which it is not:
-  // every later pass reads the order too, and some of them read things this
-  // model has no name for. On materialize-frame-index-sgpr.ll moving an SCC
-  // def three slots down shortens $scc's live range, which makes frame-index
-  // lowering pick its scalar path, which needs an SGPR that is not there.
-  // Nothing in a cycle count can see that coming, so a tie has to lose.
-  //
-  // "Equal cost" now includes demand, so an order that is the same length but
-  // holds fewer registers is no longer a tie -- it is a win, and a win with a
-  // reason behind it rather than an arbitrary tie-break.
-  Cost SourceCost = P.costOf(Order);
-  Cost NewCost = P.costOf(A.Order);
-  auto ShowCost = [](const Cost &C) {
-    return formatv("excess {0}, {1} cycles, peak {2}", C.Excess, C.Makespan,
-                   C.Peak);
-  };
-  LLVM_DEBUG(dbgs() << "optsched: cost (" << ShowCost(SourceCost) << ") -> ("
-                    << ShowCost(NewCost) << ")\n");
-  if (AllowTies ? SourceCost < NewCost : !(NewCost < SourceCost)) {
-    LLVM_DEBUG(
-        dbgs() << "optsched: (" << ShowCost(NewCost) << ") vs source ("
-               << ShowCost(SourceCost)
-               << "); not strictly better, keeping the existing order\n");
-    return;
-  }
-
-  // Room, as opposed to pressure. Pressure says how many registers a schedule
-  // wants; this says whether some value has anywhere at all to go, which is a
-  // different question and the one the allocator fails on. Stretching a value
-  // across a pre-coloured range is not expensive, it is impossible -- there is
-  // nothing to evict and nothing to spill that would help -- so this is a gate
-  // and not a term in Cost.
-  //
-  // Relative, not absolute: the source order is allocatable by assumption, so
-  // what matters is that we did not make it worse. An absolute test would
-  // refuse regions that were already tight and that we left alone.
-  unsigned SourceShort = P.shortfallOf(Order);
-  unsigned NewShort = P.shortfallOf(A.Order);
-  LLVM_DEBUG(dbgs() << "optsched: budget " << P.budget()[RegFile::SGPR]
-                    << " SGPR / " << P.budget()[RegFile::ArchVGPR] << "+"
-                    << P.budget()[RegFile::AGPR] << " VGPR; shortfall "
-                    << SourceShort << " -> " << NewShort << "\n");
-  if (NewShort > SourceShort) {
-    ++NumShortfallRejects;
-    LLVM_DEBUG(dbgs() << "optsched: shortfall " << SourceShort << " -> "
-                      << NewShort
-                      << "; the new order leaves a value with no register to "
-                         "live in, keeping the existing order\n");
-    return;
-  }
-
-  if (!AllowPressureIncrease) {
-    bool Unified = DAG.MF.getSubtarget<GCNSubtarget>().hasGFX90AInsts();
-    UnitFiles Files(*static_cast<const SIRegisterInfo *>(DAG.TRI), DAG.MRI);
-    Demand Before = demandOf(DAG, Order, Files, Unified);
-    Demand After = demandOf(DAG, A.Order, Files, Unified);
-    auto Show = [](const Demand &D) {
-      return formatv("{0}+{1} VGPR / {2} SGPR", D.ArchVGPR, D.AGPR, D.SGPR);
-    };
-    LLVM_DEBUG(dbgs() << "optsched: demand " << Show(Before) << " -> "
-                      << Show(After) << "\n");
-    if (!After.noWorseThan(Before)) {
-      ++NumPressureRejects;
-      ++NumModelDisagreements;
-      // Worth naming, not just counting. The search believed this order was
-      // no worse on demand and the trackers say otherwise, so Problem's model
-      // and the allocator's view have come apart somewhere -- most likely a
-      // physical range the pinning edges did not cover, or a subregister lane
-      // the model flattens. The gate catches it either way; this line is how
-      // to find out that it happened.
-      LLVM_DEBUG(dbgs() << "optsched: model said (" << ShowCost(NewCost)
-                        << ") beats (" << ShowCost(SourceCost)
-                        << ") but measured demand " << Show(Before) << " -> "
-                        << Show(After) << "; keeping the existing order\n");
-      return;
+  // Gate one answer and adopt it if it wins on every count. Every answer goes
+  // through this, so the floor below cannot enter by a side door that the
+  // solver's own answer would not have been allowed through.
+  auto Adopt = [&](const Answer &Cand, const Twine &What) -> bool {
+    if (Error E = verify(P, Cand)) {
+      ++NumUnverified;
+      LLVM_DEBUG(dbgs() << "optsched: rejected, " << toStringWithoutConsuming(E)
+                        << "; keeping the existing order\n");
+      consumeError(std::move(E));
+      return false;
     }
-  }
+    if (Cand.St == Status::Optimal)
+      ++NumProved;
 
-  if (A.Order != Order) {
-    ++NumApplied;
-    LLVM_DEBUG(dbgs() << "optsched: applying " << toString(A.St)
-                      << " schedule, " << SourceMakespan << " -> " << A.Makespan
-                      << " cycles\n");
-    Order = A.Order;
+    // Strictly better, not merely as good. An equal-cost reorder buys nothing
+    // and bets the whole region on our model being complete, which it is not:
+    // every later pass reads the order too, and some of them read things this
+    // model has no name for. On materialize-frame-index-sgpr.ll moving an SCC
+    // def three slots down shortens $scc's live range, which makes frame-index
+    // lowering pick its scalar path, which needs an SGPR that is not there.
+    // Nothing in a cycle count can see that coming, so a tie has to lose.
+    //
+    // "Equal cost" now includes demand, so an order that is the same length but
+    // holds fewer registers is no longer a tie -- it is a win, and a win with a
+    // reason behind it rather than an arbitrary tie-break.
+    Cost CurCost = P.costOf(Order);
+    Cost NewCost = P.costOf(Cand.Order);
+    auto ShowCost = [](const Cost &C) {
+      return formatv("excess {0}, {1} cycles, peak {2}", C.Excess, C.Makespan,
+                     C.Peak);
+    };
+    LLVM_DEBUG(dbgs() << "optsched: cost (" << ShowCost(CurCost) << ") -> ("
+                      << ShowCost(NewCost) << ")\n");
+    if (AllowTies ? CurCost < NewCost : !(NewCost < CurCost)) {
+      LLVM_DEBUG(
+          dbgs() << "optsched: (" << ShowCost(NewCost) << ") vs source ("
+                 << ShowCost(CurCost)
+                 << "); not strictly better, keeping the existing order\n");
+      return false;
+    }
+
+    // Room, as opposed to pressure. Pressure says how many registers a schedule
+    // wants; this says whether some value has anywhere at all to go, which is a
+    // different question and the one the allocator fails on. Stretching a value
+    // across a pre-coloured range is not expensive, it is impossible -- there
+    // is nothing to evict and nothing to spill that would help -- so this is a
+    // gate and not a term in Cost.
+    //
+    // Relative, not absolute: the order we hold is allocatable by assumption,
+    // so what matters is that we did not make it worse. An absolute test would
+    // refuse regions that were already tight and that we left alone.
+    unsigned CurShort = P.shortfallOf(Order);
+    unsigned NewShort = P.shortfallOf(Cand.Order);
+    LLVM_DEBUG(dbgs() << "optsched: budget " << P.budget()[RegFile::SGPR]
+                      << " SGPR / " << P.budget()[RegFile::ArchVGPR] << "+"
+                      << P.budget()[RegFile::AGPR] << " VGPR; shortfall "
+                      << CurShort << " -> " << NewShort << "\n");
+    if (NewShort > CurShort) {
+      ++NumShortfallRejects;
+      LLVM_DEBUG(dbgs() << "optsched: shortfall " << CurShort << " -> "
+                        << NewShort
+                        << "; the new order leaves a value with no register to "
+                           "live in, keeping the existing order\n");
+      return false;
+    }
+
+    if (!AllowPressureIncrease) {
+      bool Unified = DAG.MF.getSubtarget<GCNSubtarget>().hasGFX90AInsts();
+      UnitFiles Files(*static_cast<const SIRegisterInfo *>(DAG.TRI), DAG.MRI);
+      Demand Before = demandOf(DAG, Order, Files, Unified);
+      Demand After = demandOf(DAG, Cand.Order, Files, Unified);
+      auto Show = [](const Demand &D) {
+        return formatv("{0}+{1} VGPR / {2} SGPR", D.ArchVGPR, D.AGPR, D.SGPR);
+      };
+      LLVM_DEBUG(dbgs() << "optsched: demand " << Show(Before) << " -> "
+                        << Show(After) << "\n");
+      if (!After.noWorseThan(Before)) {
+        ++NumPressureRejects;
+        ++NumModelDisagreements;
+        // Worth naming, not just counting. The search believed this order was
+        // no worse on demand and the trackers say otherwise, so Problem's model
+        // and the allocator's view have come apart somewhere -- most likely a
+        // physical range the pinning edges did not cover, or a subregister lane
+        // the model flattens. The gate catches it either way; this line is how
+        // to find out that it happened.
+        LLVM_DEBUG(dbgs() << "optsched: model said (" << ShowCost(NewCost)
+                          << ") beats (" << ShowCost(CurCost)
+                          << ") but measured demand " << Show(Before) << " -> "
+                          << Show(After) << "; keeping the existing order\n");
+        return false;
+      }
+    }
+
+    if (Cand.Order != Order) {
+      ++NumApplied;
+      LLVM_DEBUG(dbgs() << "optsched: applying " << What << ", " << CurMakespan
+                        << " -> " << Cand.Makespan << " cycles\n");
+      Order = Cand.Order;
+      CurMakespan = Cand.Makespan;
+    }
+    return true;
+  };
+
+  if (Adopt(A, toString(A.St) + " schedule"))
+    return;
+
+  // The answer lost, and the order we are holding is the one the region
+  // arrived with. That is pre-scheduler order: -misched=amdgpu-optsched
+  // replaces GCNSchedStrategy outright, so nothing downstream will improve it,
+  // and leaving it alone is a choice to ship whatever the earlier passes
+  // happened to leave behind.
+  //
+  // The list schedule is not optimal and is not claimed to be, but it is legal,
+  // it is cheap to build, and it is what this scheduler would have produced on
+  // a region the search was never going to fit. So it is the floor. It faces
+  // the same gates as any other answer, so a region whose list schedule is
+  // worse than what it arrived with still keeps what it arrived with.
+  //
+  // Skipped when the solver already was the list solver: that answer has just
+  // been through these gates and lost, and it would lose again.
+  if (UseListFloor && !SolverIsList) {
+    Answer L = createListSolver()->solve(P);
+    LLVM_DEBUG(dbgs() << "optsched: falling back, solver=" << L.Solver
+                      << " status=" << toString(L.St) << " makespan="
+                      << L.Makespan << " (holding " << CurMakespan << ")\n");
+    Adopt(L, "list floor");
   }
 }
 
