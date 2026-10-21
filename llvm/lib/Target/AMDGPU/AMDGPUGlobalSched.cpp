@@ -765,6 +765,10 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
              << printMBBReference(*MI->getParent()) << " "
              << TII->getName(MI->getOpcode()) << " at " << Start.lookup(MI)
              << "\n";
+    for (MachineInstr *MI : BySteps)
+      dbgs() << "amdgpu-global-sched:   on steps "
+             << printMBBReference(*MI->getParent()) << " "
+             << TII->getName(MI->getOpcode()) << "\n";
     for (auto &[MI, P] : Found)
       dbgs() << "amdgpu-global-sched:   " << printMBBReference(*P.Home) << " "
              << TII->getName(MI->getOpcode()) << " start " << Start.lookup(MI)
