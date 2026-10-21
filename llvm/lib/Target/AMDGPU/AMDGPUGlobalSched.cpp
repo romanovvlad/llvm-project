@@ -52,6 +52,7 @@
 #include "SIRegisterInfo.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/CodeGen/MachineCycleAnalysis.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
@@ -117,10 +118,10 @@ private:
   }
 };
 
-/// The two kinds of memory a gfx9 instruction can touch. Coarse on purpose:
-/// the question here is which pairs have to keep their order, and the target
-/// predicates can answer that without any alias analysis.
-enum : unsigned { MemLDS = 1u << 0, MemVMEM = 1u << 1 };
+/// How many memory instructions back to ask about aliasing before giving up
+/// and ordering everything against one point. The comparison is pairwise, so
+/// without a bound one block of loads and stores is quadratic.
+static constexpr unsigned MemWindow = 512;
 
 class AMDGPUGlobalSchedImpl {
 public:
@@ -154,10 +155,6 @@ private:
 
   /// Every instruction of \p MF in a topological order of its dependences.
   SmallVector<MachineInstr *, 0> orderOf(MachineFunction &MF) const;
-
-  /// Which memory an instruction may touch, as a mask of MemLDS and MemVMEM.
-  /// Zero when it touches none.
-  unsigned memClassOf(const MachineInstr &MI) const;
 
   /// Whether \p MI is a sequence point: nothing may be moved across it in
   /// either direction, whatever the values say.
@@ -417,18 +414,6 @@ AMDGPUGlobalSchedImpl::orderOf(MachineFunction &MF) const {
   return Order;
 }
 
-unsigned AMDGPUGlobalSchedImpl::memClassOf(const MachineInstr &MI) const {
-  if (!MI.mayLoadOrStore())
-    return 0;
-  if (TII->isDS(MI))
-    return MemLDS;
-  // Generic FLAT is the one form whose address decides at run time which of
-  // the two it is, so it has to be ordered against both.
-  if (TII->isFLAT(MI) && !TII->isFLATGlobal(MI) && !TII->isFLATScratch(MI))
-    return MemLDS | MemVMEM;
-  return MemVMEM;
-}
-
 bool AMDGPUGlobalSchedImpl::isFence(const MachineInstr &MI) const {
   // S_BARRIER and friends arrive here as "side effects the model does not
   // carry", which is exactly what a sequence point is.
@@ -459,8 +444,7 @@ void AMDGPUGlobalSchedImpl::buildDeps(MachineFunction &MF, DepGraph &G) const {
   for (MachineBasicBlock &MBB : MF) {
     DenseMap<MCRegUnit, MachineInstr *> LastDef;
     DenseMap<MCRegUnit, SmallVector<MachineInstr *, 4>> ReadsSince;
-    MachineInstr *LastStore[2] = {};
-    SmallVector<MachineInstr *, 8> LoadsSince[2];
+    SmallVector<MachineInstr *, 0> MemOps;
     MachineInstr *Fence = nullptr;
     SmallVector<MachineInstr *, 0> Pending;
 
@@ -483,9 +467,7 @@ void AMDGPUGlobalSchedImpl::buildDeps(MachineFunction &MF, DepGraph &G) const {
         Pending.clear();
         LastDef.clear();
         ReadsSince.clear();
-        LastStore[0] = LastStore[1] = nullptr;
-        LoadsSince[0].clear();
-        LoadsSince[1].clear();
+        MemOps.clear();
         continue;
       }
       if (Fence)
@@ -514,26 +496,27 @@ void AMDGPUGlobalSchedImpl::buildDeps(MachineFunction &MF, DepGraph &G) const {
         }
       }
 
-      // Memory. Two accesses of the same kind keep their order unless both
-      // only read; which kind is all the resolution there is here, and it is
-      // enough to separate the LDS traffic from everything else.
-      if (unsigned Cls = memClassOf(MI)) {
-        for (unsigned C = 0; C != 2; ++C) {
-          if (!(Cls & (1u << C)))
+      // Memory. Two accesses keep their order only if one writes bytes the
+      // other can see, which mayAlias answers -- separating the LDS traffic
+      // from everything else, and separating two accesses of the same base
+      // whose constant offsets cannot overlap. Without the second of those
+      // the chain runs through all sixteen writes of an LDS tile, an order
+      // the hardware never has to honour.
+      if (MI.mayLoadOrStore()) {
+        // At the cap, order this against the whole window whether it aliases
+        // or not. It then stands in for all of it -- anything later ordered
+        // after this one is ordered after them too -- so the window can
+        // start again from here without losing a constraint.
+        bool Full = MemOps.size() >= MemWindow;
+        for (MachineInstr *M : MemOps) {
+          if (!Full && !MI.mayAlias(static_cast<AAResults *>(nullptr), *M,
+                                    /*UseTBAA=*/true))
             continue;
-          if (MI.mayStore()) {
-            if (LastStore[C])
-              G.add(LastStore[C], &MI, 1);
-            for (MachineInstr *L : LoadsSince[C])
-              G.add(L, &MI, 1);
-            LastStore[C] = &MI;
-            LoadsSince[C].clear();
-          } else {
-            if (LastStore[C])
-              G.add(LastStore[C], &MI, latencyOf(*LastStore[C]));
-            LoadsSince[C].push_back(&MI);
-          }
+          G.add(M, &MI, M->mayStore() && MI.mayLoad() ? latencyOf(*M) : 1);
         }
+        if (Full)
+          MemOps.clear();
+        MemOps.push_back(&MI);
       }
 
       Pending.push_back(&MI);
