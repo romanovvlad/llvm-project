@@ -11,7 +11,7 @@
 #
 # There are two longest paths here and they are different paths:
 #
-#   %0 -> %1 -> %2            a load, so three instructions and ~82 cycles
+#   %0 -> %1 -> %10 -> %2     a load, so four instructions and ~83 cycles
 #   %3 -> %4 -> ... -> %8     six adds, so six instructions and six cycles
 #
 # Weighted by latency the load wins; weighted by one per step the adds do.
@@ -19,12 +19,19 @@
 # but the second is the longer run of instructions that has to stay in the
 # order it is in.
 
-# CHECK: amdgpu-global-sched: path by cycles: 4 instrs, 82 cycles
+# CHECK: amdgpu-global-sched: path by cycles: 5 instrs, 83 cycles
 # CHECK: amdgpu-global-sched: path by steps: 7 instrs, 6 steps
+
+# %9 reads the load and is read by the last step, so it is both before and
+# after the path -- it lives in the gap between two of its steps. Nothing
+# here is unordered against the path, because every instruction feeds the
+# S_ENDPGM that ends it.
+# CHECK: around the path: 7 before, 1 after, 1 both, 0 unordered
 
 # The cycle path runs through the load, not through the adds.
 # CHECK: on path %bb.0 COPY
 # CHECK-NEXT: on path %bb.0 GLOBAL_LOAD_DWORD
+# CHECK-NEXT: on path %bb.0 V_ADD_U32_e32
 # CHECK-NEXT: on path %bb.0 V_ADD_U32_e32
 # CHECK-NEXT: on path %bb.0 S_ENDPGM
 
@@ -37,7 +44,12 @@ body:             |
 
     %0:vreg_64_align2 = COPY $vgpr2_vgpr3
     %1:vgpr_32 = GLOBAL_LOAD_DWORD %0, 0, 0, implicit $exec :: (load (s32))
-    %2:vgpr_32 = V_ADD_U32_e32 %1, %1, implicit $exec
+    %10:vgpr_32 = V_ADD_U32_e32 %1, %1, implicit $exec
+    %2:vgpr_32 = V_ADD_U32_e32 %10, %10, implicit $exec
+
+    ; reads the load and is read by the end of the path, so it sits strictly
+    ; between two steps of it
+    %9:vgpr_32 = V_XOR_B32_e32 %1, %1, implicit $exec
 
     %3:vgpr_32 = COPY $vgpr0
     %4:vgpr_32 = V_ADD_U32_e32 %3, %3, implicit $exec
@@ -46,5 +58,5 @@ body:             |
     %7:vgpr_32 = V_ADD_U32_e32 %6, %6, implicit $exec
     %8:vgpr_32 = V_ADD_U32_e32 %7, %7, implicit $exec
 
-    S_ENDPGM 0, implicit %2, implicit %8
+    S_ENDPGM 0, implicit %2, implicit %8, implicit %9
 ...

@@ -588,6 +588,48 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
            << " instrs, " << CycleWeight << " cycles\n";
     dbgs() << "amdgpu-global-sched: path by steps: " << BySteps.size()
            << " instrs, " << StepWeight << " steps\n";
+    // Where everything else stands with respect to that path. An instruction
+    // that reaches a step of the path has to come before that step; one the
+    // path reaches has to come after; the rest are ordered against it by
+    // nothing at all, and are the only ones a placement is free to choose for.
+    DenseSet<const MachineInstr *> OnPath(ByCycles.begin(), ByCycles.end());
+    DenseSet<const MachineInstr *> Before, After;
+
+    SmallVector<MachineInstr *, 0> Work(ByCycles);
+    while (!Work.empty()) {
+      MachineInstr *MI = Work.pop_back_val();
+      if (MI->isPHI())
+        continue;
+      for (const MachineOperand &MO : MI->uses()) {
+        if (!MO.isReg() || !MO.getReg().isVirtual())
+          continue;
+        MachineInstr *Def = MRI->getVRegDef(MO.getReg());
+        if (!OnPath.count(Def) && Before.insert(Def).second)
+          Work.push_back(Def);
+      }
+    }
+
+    Work.assign(ByCycles.begin(), ByCycles.end());
+    while (!Work.empty()) {
+      MachineInstr *MI = Work.pop_back_val();
+      for (const MachineOperand &MO : MI->defs()) {
+        if (!MO.isReg() || !MO.getReg().isVirtual())
+          continue;
+        for (MachineInstr &Use : MRI->use_nodbg_instructions(MO.getReg())) {
+          if (Use.isPHI())
+            continue;
+          if (!OnPath.count(&Use) && After.insert(&Use).second)
+            Work.push_back(&Use);
+        }
+      }
+    }
+
+    unsigned Both = count_if(After, [&](auto *MI) { return Before.count(MI); });
+    dbgs() << "amdgpu-global-sched: around the path: " << Before.size()
+           << " before, " << After.size() << " after, " << Both << " both, "
+           << NumInstrs - OnPath.size() - Before.size() - After.size() + Both
+           << " unordered\n";
+
     for (MachineInstr *MI : ByCycles)
       dbgs() << "amdgpu-global-sched:   on path "
              << printMBBReference(*MI->getParent()) << " "
