@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "AMDGPUOptSched.h"
+#include "GCNRegPressure.h"
 #include "GCNSubtarget.h"
 #include "SIRegisterInfo.h"
 #include "llvm/ADT/BitVector.h"
@@ -89,7 +90,7 @@ static unsigned filesOf(const SIRegisterInfo &TRI,
 // Problem
 //===----------------------------------------------------------------------===//
 
-Problem Problem::build(const ScheduleDAGMI &DAG) {
+Problem Problem::build(const ScheduleDAGMILive &DAG) {
   Problem P;
   const unsigned N = DAG.SUnits.size();
 
@@ -238,7 +239,7 @@ Problem Problem::build(const ScheduleDAGMI &DAG) {
   return P;
 }
 
-void Problem::buildRegisterModel(const ScheduleDAGMI &DAG) {
+void Problem::buildRegisterModel(const ScheduleDAGMILive &DAG) {
   const unsigned N = size();
   Defs.resize(N);
   Uses.resize(N);
@@ -444,6 +445,38 @@ void Problem::buildRegisterModel(const ScheduleDAGMI &DAG) {
     }
   }
 
+  // Values that cross the region without ever being named in it.
+  //
+  // Everything above is built from the operands of the instructions we were
+  // given, so a vreg defined above the region and read below it appears
+  // nowhere in Values and pressureOf never counts it. In a kernel that carries
+  // a large accumulator across a small region that omission is most of the
+  // register file, and it is what makes a region that cannot fit look like one
+  // that does: Bud.excessOf comes out zero and the objective collapses to
+  // makespan, so the search spends live ranges on cycles it has no room to
+  // buy.
+  //
+  // No order can shorten these, so the term is a constant and changes no
+  // comparison between two candidates. What it changes is whether either of
+  // them is over budget, and that is the first question the cost asks.
+  //
+  // Live immediately before the first instruction and unnamed in the region is
+  // exactly live-through: a range whose last read is the instruction above the
+  // region has already ended by that point, so it is not in this set.
+  GCNRPTracker::LiveRegSet Through =
+      getLiveRegsBefore(*DAG.begin(), *DAG.getLIS());
+  SmallVector<unsigned, 8> Named;
+  for (auto [Reg, Lanes] : Through)
+    if (Index.contains(Register(Reg)))
+      Named.push_back(Reg);
+  for (unsigned Reg : Named)
+    Through.erase(Reg);
+
+  GCNRegPressure ThroughRP = getRegPressure(MRI, Through);
+  LiveThru[RegFile::SGPR] = ThroughRP.getSGPRNum();
+  LiveThru[RegFile::ArchVGPR] = ThroughRP.getArchVGPRNum();
+  LiveThru[RegFile::AGPR] = ThroughRP.getAGPRNum();
+
   // The last segment of each unit is the one that can outlive the region.
   for (auto [U, V] : CurUnit)
     Values[V].LiveOut = Below.getBitVector().test(U);
@@ -483,7 +516,9 @@ unsigned Budget::excessOf(const Pressure &P) const {
 }
 
 Pressure Problem::pressureOf(ArrayRef<unsigned> Order) const {
-  Pressure Cur;
+  // Whatever crosses the region is held for all of it, so it is where the
+  // count starts rather than something added at the end.
+  Pressure Cur = LiveThru;
   SmallVector<unsigned, 0> Left(Values.size());
   for (unsigned V = 0, E = Values.size(); V != E; ++V) {
     Left[V] = Values[V].Uses;

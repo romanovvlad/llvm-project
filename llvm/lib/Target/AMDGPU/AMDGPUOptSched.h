@@ -52,6 +52,7 @@ namespace llvm {
 class MachineSchedContext;
 class ScheduleDAGInstrs;
 class ScheduleDAGMI;
+class ScheduleDAGMILive;
 class raw_ostream;
 
 namespace AMDGPUOptSched {
@@ -240,7 +241,7 @@ public:
   /// Weak edges (clustering and similar hints) are deliberately absent: they
   /// are preferences, not legality, and the generic scheduler treats them the
   /// same way. A schedule that ignores them is slower, not wrong.
-  static Problem build(const ScheduleDAGMI &DAG);
+  static Problem build(const ScheduleDAGMILive &DAG);
 
   unsigned size() const { return NodeLatency.size(); }
   ArrayRef<Edge> edges() const { return Edges; }
@@ -282,6 +283,11 @@ public:
   //===--------------------------------------------------------------------===//
 
   ArrayRef<RegValue> values() const { return Values; }
+  /// Registers held across the whole region by values it never names: defined
+  /// above it, read below it. No order can free one, so this is a constant
+  /// added to every candidate's pressure -- but it is the constant that
+  /// decides whether the region fits, and Cost::Excess is the first term.
+  const Pressure &liveThrough() const { return LiveThru; }
   /// Values whose live range starts at \p N. A value redefined inside the
   /// region is listed only at its first definition, which is where its range
   /// begins.
@@ -346,9 +352,10 @@ private:
   SmallVector<SmallVector<unsigned, 2>, 0> Uses;
   SmallVector<Constraint, 0> Constraints;
   Budget Bud;
+  Pressure LiveThru;
 
   void computeHeights();
-  void buildRegisterModel(const ScheduleDAGMI &DAG);
+  void buildRegisterModel(const ScheduleDAGMILive &DAG);
 };
 
 //===----------------------------------------------------------------------===//

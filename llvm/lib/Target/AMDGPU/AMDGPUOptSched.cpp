@@ -1046,10 +1046,14 @@ void OptSchedStrategy::initialize(ScheduleDAGMI *DAGMI) {
   }
   Answer A = S->solve(P);
 
+  const Pressure &Thru = P.liveThrough();
   LLVM_DEBUG(dbgs() << "optsched: " << P.Name << " n=" << P.size()
-                    << " edges=" << P.edges().size() << " solver=" << A.Solver
-                    << " status=" << toString(A.St) << " makespan="
-                    << A.Makespan << " (source " << SourceMakespan << ")\n");
+                    << " edges=" << P.edges().size() << " live-through "
+                    << Thru[RegFile::ArchVGPR] << "+" << Thru[RegFile::AGPR]
+                    << " VGPR / " << Thru[RegFile::SGPR] << " SGPR"
+                    << " solver=" << A.Solver << " status=" << toString(A.St)
+                    << " makespan=" << A.Makespan << " (source "
+                    << SourceMakespan << ")\n");
 
   // The order we are holding, and what it costs. Both move if an answer is
   // adopted: a second answer is then measured against what we already have,
@@ -1132,6 +1136,17 @@ void OptSchedStrategy::initialize(ScheduleDAGMI *DAGMI) {
       };
       LLVM_DEBUG(dbgs() << "optsched: demand " << Show(Before) << " -> "
                         << Show(After) << "\n");
+      // What the model thought, in the same units. The gate above is the
+      // truth; printing the two side by side is how a gap between them gets
+      // found rather than guessed at.
+      DEBUG_WITH_TYPE("amdgpu-optsched-regs", {
+        auto ShowP = [](const Pressure &Pr) {
+          return formatv("{0}+{1} VGPR / {2} SGPR", Pr[RegFile::ArchVGPR],
+                         Pr[RegFile::AGPR], Pr[RegFile::SGPR]);
+        };
+        dbgs() << "optsched: model " << ShowP(P.pressureOf(Order)) << " -> "
+               << ShowP(P.pressureOf(Cand.Order)) << "\n";
+      });
       if (!After.noWorseThan(Before)) {
         ++NumPressureRejects;
         ++NumModelDisagreements;
