@@ -1,0 +1,50 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx900 -run-pass=machine-scheduler \
+# RUN:     -misched=amdgpu-optsched -o - %s | FileCheck %s
+#
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx900 -run-pass=machine-scheduler \
+# RUN:     -misched=amdgpu-optsched -amdgpu-optsched-pin-physregs=1 -o - %s \
+# RUN:   | FileCheck %s --check-prefix=PINNED
+
+# A physical live range is something the schedule can stretch or shrink, so it
+# is something the search has to be able to see.
+#
+# $sgpr10 and $sgpr11 are written at the top and read at the bottom, holding
+# two SGPRs across a multiply chain that wants neither of them. Closing that
+# gap costs nothing -- every order of this region is the same length -- and
+# hands two registers back for the length of the chain, at the price of the one
+# register the result needs. The search closes it by lifting the reader rather
+# than sinking the writers; either end would do, and the live range is the same
+# length whichever moves.
+#
+# -amdgpu-optsched-pin-physregs=1 is the old behaviour, kept to tell a
+# physical-liveness bug apart from a scheduling one: anything naming an
+# allocatable physical register was nailed to its original position, because
+# the demand model counted virtual registers only and a move like this one was
+# invisible to it. Modelling the units is what replaced it -- and it is a
+# replacement, not a removal, because the pin was load-bearing. See
+# optsched-physreg-pin.ll for the order this must still refuse.
+
+# CHECK-LABEL: name: sink_physreg_setup
+# CHECK:      $sgpr11 = S_MOV_B32 2
+# CHECK-NEXT: S_MUL_I32 $sgpr10, $sgpr11
+
+# PINNED-LABEL: name: sink_physreg_setup
+# PINNED:      $sgpr11 = S_MOV_B32 2
+# PINNED-NEXT: S_MOV_B32 7
+
+---
+name:            sink_physreg_setup
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    $sgpr10 = S_MOV_B32 1
+    $sgpr11 = S_MOV_B32 2
+    %1:sreg_32 = S_MOV_B32 7
+    %2:sreg_32 = S_MUL_I32 %1, %1
+    %3:sreg_32 = S_MUL_I32 %2, %2
+    %4:sreg_32 = S_MUL_I32 %3, %3
+    %5:sreg_32 = S_MUL_I32 %4, %4
+    %6:sreg_32 = S_MUL_I32 $sgpr10, $sgpr11
+    %7:sreg_32 = S_MUL_I32 %5, %6
+    S_ENDPGM 0, implicit %7
+...

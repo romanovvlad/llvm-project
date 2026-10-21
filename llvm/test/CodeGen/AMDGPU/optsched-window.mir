@@ -1,0 +1,64 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx90a -run-pass=machine-scheduler \
+# RUN:     -misched=amdgpu-optsched -debug-only=amdgpu-optsched -o - %s 2>&1 \
+# RUN:   | FileCheck %s
+#
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx90a -run-pass=machine-scheduler \
+# RUN:     -misched=amdgpu-optsched -amdgpu-optsched-window=0 \
+# RUN:     -debug-only=amdgpu-optsched -o - %s 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=NOWINDOW
+#
+# REQUIRES: asserts
+
+# Eighteen instructions is two more than the exhaustive search can enumerate,
+# and the region is the same shape as optsched-pipe-occupancy.mir: two MFMAs
+# that need nothing from each other, and a scalar chain that needs nothing from
+# either. The matrix pipe makes the second MFMA wait eight cycles for the
+# first, and that window is big enough to hold the whole chain.
+#
+# Up to here the answer on a region this size was the list scheduler's. It gets
+# part of the way: it knows the first MFMA can start early and it fills some of
+# the pipe's shadow with the chain, which is 26 cycles. It cannot get the rest,
+# because it commits to one instruction at a time and never goes back, and the
+# remaining win needs the *second* MFMA moved into the middle of the chain as
+# well -- a move that is worth nothing until the first one has already moved.
+#
+# The window search gets it because it never has to look at eighteen
+# instructions at once. It looks at sixteen, in place, with everything outside
+# the window held fixed, and asks only whether those can be rearranged into
+# something the region as a whole is cheaper for. Both MFMAs are inside one
+# window, so the pair of moves is considered together rather than one at a
+# time, and 19 cycles is what the pipe makes the region: the first MFMA issues
+# at cycle 3, the second at 11 the moment the pipe frees, and the chain runs in
+# the gaps.
+
+# CHECK: optsched: {{.*}} n=18 {{.*}} solver=window status=upper-bound makespan=19 (source 33)
+# CHECK: optsched: applying upper-bound schedule, 33 -> 19 cycles
+
+# NOWINDOW: optsched: {{.*}} n=18 {{.*}} solver=list status=witness makespan=26 (source 33)
+# NOWINDOW: optsched: applying witness schedule, 33 -> 26 cycles
+
+---
+name:            window_fills_the_matrix_window
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    %0:av_64_align2 = IMPLICIT_DEF
+    %1:areg_128_align2 = IMPLICIT_DEF
+    %10:sreg_32 = S_MOV_B32 1
+    %11:sreg_32 = S_ADD_I32 %10, %10, implicit-def dead $scc
+    %12:sreg_32 = S_ADD_I32 %11, %11, implicit-def dead $scc
+    %13:sreg_32 = S_ADD_I32 %12, %12, implicit-def dead $scc
+    %14:sreg_32 = S_ADD_I32 %13, %13, implicit-def dead $scc
+    %15:sreg_32 = S_ADD_I32 %14, %14, implicit-def dead $scc
+    %16:sreg_32 = S_ADD_I32 %15, %15, implicit-def dead $scc
+    %17:sreg_32 = S_ADD_I32 %16, %16, implicit-def dead $scc
+    %18:sreg_32 = S_ADD_I32 %17, %17, implicit-def dead $scc
+    %19:sreg_32 = S_ADD_I32 %18, %18, implicit-def dead $scc
+    %20:sreg_32 = S_ADD_I32 %19, %19, implicit-def dead $scc
+    %21:sreg_32 = S_ADD_I32 %20, %20, implicit-def dead $scc
+    %22:sreg_32 = S_ADD_I32 %21, %21, implicit-def dead $scc
+    %23:sreg_32 = S_ADD_I32 %22, %22, implicit-def dead $scc
+    %2:areg_128_align2 = V_MFMA_F32_16X16X16F16_e64 %0, %0, %1, 0, 0, 0, implicit $mode, implicit $exec
+    %3:areg_128_align2 = V_MFMA_F32_16X16X16F16_e64 %0, %0, %1, 0, 0, 0, implicit $mode, implicit $exec
+    S_ENDPGM 0, implicit %2, implicit %3, implicit %23
+...

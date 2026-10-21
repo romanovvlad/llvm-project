@@ -1,0 +1,68 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx90a -run-pass=machine-scheduler \
+# RUN:     -misched=amdgpu-optsched -o - %s | FileCheck %s
+#
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx90a -run-pass=machine-scheduler \
+# RUN:     -misched=amdgpu-optsched -debug-only=amdgpu-optsched -o /dev/null %s \
+# RUN:     2>&1 | FileCheck %s --check-prefix=LOG
+#
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx90a -run-pass=machine-scheduler \
+# RUN:     -misched=amdgpu-optsched -amdgpu-optsched-pipe-model=0 \
+# RUN:     -debug-only=amdgpu-optsched -o - %s 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=NOPIPE
+#
+# REQUIRES: asserts
+
+# Two MFMAs cost two turns of the matrix pipe, not two issue slots.
+#
+# Latency alone cannot say that. It says when a *dependent* instruction may
+# read a result, and nothing here depends on anything: both MFMAs read the
+# same two inputs and neither reads the other. A model with only latency in it
+# therefore sees no reason to separate them, puts them back to back, and calls
+# the region 12 cycles long. It is really 19 -- the second MFMA cannot start
+# until the first lets go of the pipe, eight cycles later -- and those eight
+# cycles are spent waiting with the wave idle.
+#
+# Knowing that changes what the search does with the scalar chain. It is six
+# instructions that need nothing from the MFMAs and that the MFMAs need
+# nothing from, so under the old model they were tail work to be done after
+# both MFMAs had issued. Under this one they are free: they fit inside the
+# window the first MFMA opens, and running them there costs nothing at all,
+# because the second MFMA was going to wait for the pipe regardless.
+#
+# So the order below is not "MFMA, MFMA, scalar work" but "MFMA, scalar work,
+# MFMA", and the 19 cycles it reports is the number the pipe makes it.
+
+# CHECK-LABEL: name: fill_the_matrix_window
+# CHECK:      V_MFMA_F32_16X16X16F16_e64
+# CHECK-NEXT: S_MOV_B32
+# CHECK:      S_ADD_I32
+# CHECK:      V_MFMA_F32_16X16X16F16_e64
+
+# LOG: optsched: fill_the_matrix_window: n=10 {{.*}} makespan=19 (source 25)
+
+# And the same region with the pipe model switched off, which is what this
+# used to do: the two MFMAs go back to back and the answer comes out at 12
+# cycles. The 12 is not a better schedule, it is the same schedule priced
+# with the pipe left out.
+
+# NOPIPE: optsched: fill_the_matrix_window: n=10 {{.*}} makespan=12 (source 18)
+# NOPIPE:      V_MFMA_F32_16X16X16F16_e64
+# NOPIPE-NEXT: V_MFMA_F32_16X16X16F16_e64
+
+---
+name:            fill_the_matrix_window
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    %0:av_64_align2 = IMPLICIT_DEF
+    %1:areg_128_align2 = IMPLICIT_DEF
+    %10:sreg_32 = S_MOV_B32 1
+    %11:sreg_32 = S_ADD_I32 %10, %10, implicit-def dead $scc
+    %12:sreg_32 = S_ADD_I32 %11, %11, implicit-def dead $scc
+    %13:sreg_32 = S_ADD_I32 %12, %12, implicit-def dead $scc
+    %14:sreg_32 = S_ADD_I32 %13, %13, implicit-def dead $scc
+    %15:sreg_32 = S_ADD_I32 %14, %14, implicit-def dead $scc
+    %2:areg_128_align2 = V_MFMA_F32_16X16X16F16_e64 %0, %0, %1, 0, 0, 0, implicit $mode, implicit $exec
+    %3:areg_128_align2 = V_MFMA_F32_16X16X16F16_e64 %0, %0, %1, 0, 0, 0, implicit $mode, implicit $exec
+    S_ENDPGM 0, implicit %2, implicit %3, implicit %15
+...

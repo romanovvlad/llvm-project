@@ -1,0 +1,40 @@
+# RUN: llc -mtriple=amdgpu9.00-amd-amdhsa -run-pass=machine-scheduler \
+# RUN:     -misched=amdgpu-optsched -o - %s | FileCheck %s
+
+# Register demand is part of what the search optimises, not only a gate on
+# what it returns.
+#
+# %1 is four registers held across the whole multiply chain, which needs none
+# of them. Every order of this region is ten cycles long, so a search that
+# only counts cycles has no reason to prefer any of them -- it hands back
+# whatever it looked at first and the driver throws that away as a tie.
+# Demand is what breaks the tie, and it breaks it by putting %1's definition
+# and its one reader next to each other, which takes three registers out of
+# the chain for free. (Either end may move; the search here finds it cheaper
+# to raise the reader than to sink the REG_SEQUENCE. Same live range, same
+# cost -- what the test is about is that the gap closes.)
+#
+# This is not the old "apply anything that ties" behaviour coming back. A bare
+# tie still loses, because a tie-break with no reason behind it bets the region
+# on this model being complete, and it is not. Here there is a reason.
+
+# CHECK-LABEL: name: sink_wide_value
+# CHECK:      %1:sgpr_128 = REG_SEQUENCE
+# CHECK-NEXT: S_MUL_I32 %1.sub0, %1.sub3
+
+---
+name:            sink_wide_value
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    %10:sreg_32 = S_MOV_B32 1
+    %0:sgpr_128 = REG_SEQUENCE %10, %subreg.sub0, %10, %subreg.sub1, %10, %subreg.sub2, %10, %subreg.sub3
+    %1:sreg_32 = S_MOV_B32 7
+    %2:sreg_32 = S_MUL_I32 %1, %1
+    %3:sreg_32 = S_MUL_I32 %2, %2
+    %4:sreg_32 = S_MUL_I32 %3, %3
+    %5:sreg_32 = S_MUL_I32 %4, %4
+    %6:sreg_32 = S_MUL_I32 %0.sub0, %0.sub3
+    %7:sreg_32 = S_MUL_I32 %5, %6
+    S_ENDPGM 0, implicit %7
+...

@@ -29,6 +29,7 @@
 #include "AMDGPULowerVGPREncoding.h"
 #include "AMDGPUMacroFusion.h"
 #include "AMDGPUNextUseAnalysis.h"
+#include "AMDGPUOptSched.h"
 #include "AMDGPUPerfHintAnalysis.h"
 #include "AMDGPUPreloadKernArgProlog.h"
 #include "AMDGPUPrepareAGPRAlloc.h"
@@ -877,6 +878,11 @@ static MachineSchedRegistry GCNILPSchedRegistry(
     "gcn-iterative-ilp",
     "Run GCN iterative scheduler for ILP scheduling (experimental)",
     createIterativeILPMachineScheduler);
+
+static MachineSchedRegistry
+    AMDGPUOptSchedRegistry("amdgpu-optsched",
+                           "Run the AMDGPU optimal scheduler (experimental)",
+                           createAMDGPUOptSchedDAG);
 
 LLVM_READNONE
 static StringRef getGPUOrDefault(const Triple &TT, StringRef GPU) {
