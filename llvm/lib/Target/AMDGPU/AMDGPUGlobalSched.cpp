@@ -46,6 +46,7 @@
 
 #include "AMDGPUGlobalSched.h"
 #include "AMDGPU.h"
+#include "GCNHazardRecognizer.h"
 #include "GCNSubtarget.h"
 #include "MCTargetDesc/AMDGPUMCTargetDesc.h"
 #include "SIInstrInfo.h"
@@ -1049,6 +1050,24 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
       if (Need)
         dbgs() << ", needs " << Need << " " << SchedModel.getResourceName(Pipe);
       dbgs() << "\n";
+    }
+    {
+      GCNHazardRecognizer HR(MF, GCNHazardRecognizer::OperatingMode::PreRA);
+      unsigned Waits = 0, Hit = 0;
+      for (MachineBasicBlock &MBB : MF) {
+        HR.Reset();
+        for (MachineInstr &MI : MBB) {
+          if (MI.isDebugInstr())
+            continue;
+          unsigned W = HR.getHazardWaitStates(&MI);
+          Waits += W;
+          Hit += W > 0;
+          HR.EmitInstruction(&MI);
+          HR.AdvanceCycle();
+        }
+      }
+      dbgs() << "amdgpu-global-sched: hazards: " << Waits << " wait states, "
+             << Hit << " instrs\n";
     }
     dbgs() << "amdgpu-global-sched: resources: " << ByPath
            << " cycles by dependence, " << ByPipe << " by pipe, " << Over
