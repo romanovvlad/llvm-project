@@ -1,0 +1,30 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 -run-pass=amdgpu-global-sched \
+# RUN:     -debug-only=amdgpu-global-sched -o /dev/null %s 2>&1 | FileCheck %s
+# REQUIRES: asserts
+
+# SCC is a register with no live range anyone tracks, so the only thing
+# keeping it meaning anything is the order it is written and read in.
+#
+# On the virtual registers alone the add and the select both read %0 and are
+# unordered, giving a run of three. The select reads the SCC the add wrote,
+# so the run is four.
+
+# CHECK: amdgpu-global-sched: path by steps: 4 instrs, 3 steps
+# CHECK: on steps %bb.0 COPY
+# CHECK-NEXT: on steps %bb.0 S_ADD_I32
+# CHECK-NEXT: on steps %bb.0 S_CSELECT_B32
+# CHECK-NEXT: on steps %bb.0 S_ENDPGM
+
+---
+name:            chain_physreg
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $sgpr0
+
+    %0:sreg_32 = COPY $sgpr0
+    %1:sreg_32 = S_ADD_I32 %0, 1, implicit-def $scc
+    %2:sreg_32 = S_CSELECT_B32 %0, %0, implicit $scc
+
+    S_ENDPGM 0, implicit %1, implicit %2
+...

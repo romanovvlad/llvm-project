@@ -82,6 +82,46 @@ struct Placement {
   bool isFree() const { return Pin == nullptr; }
 };
 
+/// One end of one ordering constraint: the earlier instruction has to issue,
+/// and \p Latency cycles have to pass, before the later one may. \p Other is
+/// the instruction at the far end -- the earlier one in a predecessor list,
+/// the later one in a successor list.
+struct Dep {
+  MachineInstr *Other;
+  unsigned Latency;
+};
+
+/// Everything a schedule has to respect, in one graph. The instructions are
+/// in a topological order of it, so a single sweep each way answers when
+/// anything may run.
+struct DepGraph {
+  SmallVector<MachineInstr *, 0> Order;
+  DenseMap<const MachineInstr *, SmallVector<Dep, 4>> Preds, Succs;
+
+  void add(MachineInstr *Pred, MachineInstr *Succ, unsigned Latency) {
+    if (Pred == Succ)
+      return;
+    Preds[Succ].push_back({Pred, Latency});
+    Succs[Pred].push_back({Succ, Latency});
+  }
+
+  ArrayRef<Dep> preds(const MachineInstr *MI) const { return at(Preds, MI); }
+  ArrayRef<Dep> succs(const MachineInstr *MI) const { return at(Succs, MI); }
+
+private:
+  static ArrayRef<Dep>
+  at(const DenseMap<const MachineInstr *, SmallVector<Dep, 4>> &M,
+     const MachineInstr *MI) {
+    auto It = M.find(MI);
+    return It == M.end() ? ArrayRef<Dep>() : ArrayRef<Dep>(It->second);
+  }
+};
+
+/// The two kinds of memory a gfx9 instruction can touch. Coarse on purpose:
+/// the question here is which pairs have to keep their order, and the target
+/// predicates can answer that without any alias analysis.
+enum : unsigned { MemLDS = 1u << 0, MemVMEM = 1u << 1 };
+
 class AMDGPUGlobalSchedImpl {
 public:
   AMDGPUGlobalSchedImpl(MachineDominatorTree &DT, MachineCycleInfo &CI)
@@ -115,25 +155,36 @@ private:
   /// Every instruction of \p MF in a topological order of its dependences.
   SmallVector<MachineInstr *, 0> orderOf(MachineFunction &MF) const;
 
-  /// One longest path through the dependence graph, and its weight in \p
-  /// Weight. \p ByCycles weighs an edge by its latency, giving the critical
-  /// path; otherwise each edge weighs one, giving the longest run of
-  /// instructions that cannot be exchanged with each other.
-  SmallVector<MachineInstr *, 0> chainPath(MachineFunction &MF, bool ByCycles,
+  /// Which memory an instruction may touch, as a mask of MemLDS and MemVMEM.
+  /// Zero when it touches none.
+  unsigned memClassOf(const MachineInstr &MI) const;
+
+  /// Whether \p MI is a sequence point: nothing may be moved across it in
+  /// either direction, whatever the values say.
+  bool isFence(const MachineInstr &MI) const;
+
+  /// Everything that orders one instruction before another, in one graph.
+  void buildDeps(MachineFunction &MF, DepGraph &G) const;
+
+  /// One longest path through \p G, and its weight in \p Weight. \p ByCycles
+  /// weighs an edge by its latency, giving the critical path; otherwise each
+  /// edge weighs one, giving the longest run of instructions that cannot be
+  /// exchanged with each other.
+  SmallVector<MachineInstr *, 0> chainPath(const DepGraph &G, bool ByCycles,
                                            unsigned &Weight) const;
 
   /// A path of N instructions cuts the function into N+1 regions: one before
   /// each step and one after the last. \p Count is filled with how many of
   /// the instructions not on \p Path dependence allows into each region, and
   /// \p Width with how many regions each such instruction is allowed into.
-  void regionsOf(MachineFunction &MF, ArrayRef<MachineInstr *> Path,
+  void regionsOf(const DepGraph &G, ArrayRef<MachineInstr *> Path,
                  SmallVectorImpl<unsigned> &Count,
                  SmallVectorImpl<unsigned> &Width) const;
 
-  /// Earliest and latest start time of each instruction, in cycles, as the
-  /// dependence graph alone allows. Fills \p Start and \p Slack and returns
-  /// the length of the longest chain.
-  unsigned chainOf(MachineFunction &MF,
+  /// Earliest and latest start time of each instruction, in cycles, as \p G
+  /// alone allows. Fills \p Start and \p Slack and returns the length of the
+  /// longest chain.
+  unsigned chainOf(const DepGraph &G,
                    DenseMap<const MachineInstr *, unsigned> &Start,
                    DenseMap<const MachineInstr *, unsigned> &Slack) const;
 
@@ -366,8 +417,132 @@ AMDGPUGlobalSchedImpl::orderOf(MachineFunction &MF) const {
   return Order;
 }
 
+unsigned AMDGPUGlobalSchedImpl::memClassOf(const MachineInstr &MI) const {
+  if (!MI.mayLoadOrStore())
+    return 0;
+  if (TII->isDS(MI))
+    return MemLDS;
+  // Generic FLAT is the one form whose address decides at run time which of
+  // the two it is, so it has to be ordered against both.
+  if (TII->isFLAT(MI) && !TII->isFLATGlobal(MI) && !TII->isFLATScratch(MI))
+    return MemLDS | MemVMEM;
+  return MemVMEM;
+}
+
+bool AMDGPUGlobalSchedImpl::isFence(const MachineInstr &MI) const {
+  // S_BARRIER and friends arrive here as "side effects the model does not
+  // carry", which is exactly what a sequence point is.
+  return MI.isTerminator() || MI.isCall() || MI.hasUnmodeledSideEffects() ||
+         TII->isSchedulingBoundary(MI, MI.getParent(), *MI.getMF());
+}
+
+void AMDGPUGlobalSchedImpl::buildDeps(MachineFunction &MF, DepGraph &G) const {
+  G.Order = orderOf(MF);
+
+  // Values. Every read of a virtual register waits for the one definition of
+  // it. Edges into a PHI are dropped -- a PHI reads on its incoming edge, not
+  // in its own block, and every cycle in SSA runs through one, so this is both
+  // what makes the graph acyclic and what makes G.Order topological.
+  for (MachineInstr *MI : G.Order) {
+    if (MI->isPHI())
+      continue;
+    for (const MachineOperand &MO : MI->uses()) {
+      if (!MO.isReg() || !MO.getReg().isVirtual())
+        continue;
+      MachineInstr *Def = MRI->getVRegDef(MO.getReg());
+      G.add(Def, MI, latencyBetween(*Def, *MI, MO));
+    }
+  }
+
+  // Everything else is an order between two instructions of one block, and
+  // always points forwards in program order, so G.Order stays topological.
+  for (MachineBasicBlock &MBB : MF) {
+    DenseMap<MCRegUnit, MachineInstr *> LastDef;
+    DenseMap<MCRegUnit, SmallVector<MachineInstr *, 4>> ReadsSince;
+    MachineInstr *LastStore[2] = {};
+    SmallVector<MachineInstr *, 8> LoadsSince[2];
+    MachineInstr *Fence = nullptr;
+    SmallVector<MachineInstr *, 0> Pending;
+
+    for (MachineInstr &MI : MBB) {
+      if (MI.isDebugInstr())
+        continue;
+
+      // A sequence point. Nothing crosses it either way, so everything since
+      // the last one runs into it and everything after it runs out of it, and
+      // the state of registers and memory on the far side is unknown. The
+      // weight is nought: a barrier orders the code without producing a value
+      // anybody waits for, and its modelled 500 cycles would otherwise swamp
+      // every real chain in the function.
+      if (isFence(MI)) {
+        for (MachineInstr *P : Pending)
+          G.add(P, &MI, 0);
+        if (Fence)
+          G.add(Fence, &MI, 0);
+        Fence = &MI;
+        Pending.clear();
+        LastDef.clear();
+        ReadsSince.clear();
+        LastStore[0] = LastStore[1] = nullptr;
+        LoadsSince[0].clear();
+        LoadsSince[1].clear();
+        continue;
+      }
+      if (Fence)
+        G.add(Fence, &MI, 0);
+
+      // Physical registers. Nothing tracks a live range for these across a
+      // block, so the order they are written and read in is the whole of what
+      // keeps them meaning anything.
+      for (const MachineOperand &MO : MI.operands()) {
+        if (!MO.isReg() || !MO.getReg().isPhysical())
+          continue;
+        for (MCRegUnit Unit : TRI->regunits(MO.getReg())) {
+          MachineInstr *Def = LastDef.lookup(Unit);
+          if (MO.isUse()) {
+            if (Def)
+              G.add(Def, &MI, latencyOf(*Def));
+            ReadsSince[Unit].push_back(&MI);
+            continue;
+          }
+          if (Def)
+            G.add(Def, &MI, 1);
+          for (MachineInstr *R : ReadsSince[Unit])
+            G.add(R, &MI, 1);
+          LastDef[Unit] = &MI;
+          ReadsSince.erase(Unit);
+        }
+      }
+
+      // Memory. Two accesses of the same kind keep their order unless both
+      // only read; which kind is all the resolution there is here, and it is
+      // enough to separate the LDS traffic from everything else.
+      if (unsigned Cls = memClassOf(MI)) {
+        for (unsigned C = 0; C != 2; ++C) {
+          if (!(Cls & (1u << C)))
+            continue;
+          if (MI.mayStore()) {
+            if (LastStore[C])
+              G.add(LastStore[C], &MI, 1);
+            for (MachineInstr *L : LoadsSince[C])
+              G.add(L, &MI, 1);
+            LastStore[C] = &MI;
+            LoadsSince[C].clear();
+          } else {
+            if (LastStore[C])
+              G.add(LastStore[C], &MI, latencyOf(*LastStore[C]));
+            LoadsSince[C].push_back(&MI);
+          }
+        }
+      }
+
+      Pending.push_back(&MI);
+    }
+  }
+}
+
 SmallVector<MachineInstr *, 0>
-AMDGPUGlobalSchedImpl::chainPath(MachineFunction &MF, bool ByCycles,
+AMDGPUGlobalSchedImpl::chainPath(const DepGraph &G, bool ByCycles,
                                  unsigned &Weight) const {
   // A longest path, recovered by remembering which operand was the one that
   // made each instruction wait. Every step of the result reads a value the
@@ -385,22 +560,14 @@ AMDGPUGlobalSchedImpl::chainPath(MachineFunction &MF, bool ByCycles,
 
   MachineInstr *End = nullptr;
   Weight = 0;
-  for (MachineInstr *MI : orderOf(MF)) {
+  for (MachineInstr *MI : G.Order) {
     unsigned D = 0;
     MachineInstr *From = nullptr;
-    if (!MI->isPHI()) {
-      for (const MachineOperand &MO : MI->uses()) {
-        if (!MO.isReg() || !MO.getReg().isVirtual())
-          continue;
-        MachineInstr *Def = MRI->getVRegDef(MO.getReg());
-        auto It = Depth.find(Def);
-        if (It == Depth.end())
-          continue;
-        unsigned Edge = ByCycles ? latencyBetween(*Def, *MI, MO) : 1;
-        if (It->second + Edge >= D) {
-          D = It->second + Edge;
-          From = Def;
-        }
+    for (const Dep &P : G.preds(MI)) {
+      unsigned E = Depth.lookup(P.Other) + (ByCycles ? P.Latency : 1);
+      if (E >= D) {
+        D = E;
+        From = P.Other;
       }
     }
     Depth[MI] = D;
@@ -421,7 +588,7 @@ AMDGPUGlobalSchedImpl::chainPath(MachineFunction &MF, bool ByCycles,
   return Path;
 }
 
-void AMDGPUGlobalSchedImpl::regionsOf(MachineFunction &MF,
+void AMDGPUGlobalSchedImpl::regionsOf(const DepGraph &G,
                                       ArrayRef<MachineInstr *> Path,
                                       SmallVectorImpl<unsigned> &Count,
                                       SmallVectorImpl<unsigned> &Width) const {
@@ -436,37 +603,25 @@ void AMDGPUGlobalSchedImpl::regionsOf(MachineFunction &MF,
   Count.assign(N + 1, 0);
   Width.clear();
 
-  SmallVector<MachineInstr *, 0> Order = orderOf(MF);
-
-  // The last step that has to come before an instruction. If an operand is a
-  // step, that step does; otherwise whatever had to precede the operand does.
+  // The last step that has to come before an instruction. If a predecessor is
+  // a step, that step does; otherwise whatever had to precede it does.
   DenseMap<const MachineInstr *, int> Lo;
-  for (MachineInstr *MI : Order) {
+  for (MachineInstr *MI : G.Order) {
     int L = -1;
-    if (!MI->isPHI())
-      for (const MachineOperand &MO : MI->uses()) {
-        if (!MO.isReg() || !MO.getReg().isVirtual())
-          continue;
-        MachineInstr *Def = MRI->getVRegDef(MO.getReg());
-        auto It = Step.find(Def);
-        L = std::max(L, It != Step.end() ? (int)It->second : Lo.lookup(Def));
-      }
+    for (const Dep &P : G.preds(MI)) {
+      auto It = Step.find(P.Other);
+      L = std::max(L, It != Step.end() ? (int)It->second : Lo.lookup(P.Other));
+    }
     Lo[MI] = L;
   }
 
   // And the first step that has to come after it. N means none does.
   DenseMap<const MachineInstr *, int> Hi;
-  for (MachineInstr *MI : reverse(Order)) {
+  for (MachineInstr *MI : reverse(G.Order)) {
     int H = N;
-    for (const MachineOperand &MO : MI->defs()) {
-      if (!MO.isReg() || !MO.getReg().isVirtual())
-        continue;
-      for (MachineInstr &Use : MRI->use_nodbg_instructions(MO.getReg())) {
-        if (Use.isPHI())
-          continue;
-        auto It = Step.find(&Use);
-        H = std::min(H, It != Step.end() ? (int)It->second : Hi.lookup(&Use));
-      }
+    for (const Dep &S : G.succs(MI)) {
+      auto It = Step.find(S.Other);
+      H = std::min(H, It != Step.end() ? (int)It->second : Hi.lookup(S.Other));
     }
     Hi[MI] = H;
   }
@@ -474,7 +629,7 @@ void AMDGPUGlobalSchedImpl::regionsOf(MachineFunction &MF,
   // An instruction may sit anywhere after the last step it needs and before
   // the first step that needs it. That window is a run of whole regions, and
   // it is never empty, since the path is a path.
-  for (MachineInstr *MI : Order) {
+  for (MachineInstr *MI : G.Order) {
     if (Step.count(MI))
       continue;
     int First = Lo.lookup(MI) + 1, Last = Hi.lookup(MI);
@@ -485,26 +640,15 @@ void AMDGPUGlobalSchedImpl::regionsOf(MachineFunction &MF,
 }
 
 unsigned AMDGPUGlobalSchedImpl::chainOf(
-    MachineFunction &MF, DenseMap<const MachineInstr *, unsigned> &Start,
+    const DepGraph &G, DenseMap<const MachineInstr *, unsigned> &Start,
     DenseMap<const MachineInstr *, unsigned> &Slack) const {
-  SmallVector<MachineInstr *, 0> Order = orderOf(MF);
-
-  // Forwards: the earliest an instruction can start is when its last operand
-  // is ready.
+  // Forwards: the earliest an instruction can start is when the last thing it
+  // waits for is ready.
   unsigned Length = 0;
-  for (MachineInstr *MI : Order) {
+  for (MachineInstr *MI : G.Order) {
     unsigned S = 0;
-    if (!MI->isPHI()) {
-      for (const MachineOperand &MO : MI->uses()) {
-        if (!MO.isReg() || !MO.getReg().isVirtual())
-          continue;
-        MachineInstr *Def = MRI->getVRegDef(MO.getReg());
-        auto It = Start.find(Def);
-        if (It == Start.end())
-          continue;
-        S = std::max(S, It->second + latencyBetween(*Def, *MI, MO));
-      }
-    }
+    for (const Dep &P : G.preds(MI))
+      S = std::max(S, Start.lookup(P.Other) + P.Latency);
     Start[MI] = S;
     Length = std::max(Length, S + tailOf(*MI));
   }
@@ -514,19 +658,14 @@ unsigned AMDGPUGlobalSchedImpl::chainOf(
   // is slack -- a window of start times that costs nothing, and the only room
   // there is to schedule into.
   DenseMap<const MachineInstr *, unsigned> Latest;
-  for (MachineInstr *MI : reverse(Order)) {
+  for (MachineInstr *MI : reverse(G.Order)) {
     unsigned L = Length - tailOf(*MI);
     if (auto It = Latest.find(MI); It != Latest.end())
       L = It->second;
     Slack[MI] = L - Start[MI];
-    if (MI->isPHI())
-      continue;
-    for (const MachineOperand &MO : MI->uses()) {
-      if (!MO.isReg() || !MO.getReg().isVirtual())
-        continue;
-      MachineInstr *Def = MRI->getVRegDef(MO.getReg());
-      unsigned Want = L - latencyBetween(*Def, *MI, MO);
-      auto [DI, New] = Latest.try_emplace(Def, Want);
+    for (const Dep &P : G.preds(MI)) {
+      unsigned Want = L - P.Latency;
+      auto [DI, New] = Latest.try_emplace(P.Other, Want);
       if (!New)
         DI->second = std::min(DI->second, Want);
     }
@@ -643,8 +782,11 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
     }
   });
 
+  DepGraph G;
+  buildDeps(MF, G);
+
   DenseMap<const MachineInstr *, unsigned> Start, Slack;
-  unsigned Length = chainOf(MF, Start, Slack);
+  unsigned Length = chainOf(G, Start, Slack);
 
   LLVM_DEBUG({
     unsigned OnChain =
@@ -654,8 +796,8 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
 
     // Two different longest paths, and they are rarely the same one.
     unsigned CycleWeight = 0, StepWeight = 0;
-    auto ByCycles = chainPath(MF, /*ByCycles=*/true, CycleWeight);
-    auto BySteps = chainPath(MF, /*ByCycles=*/false, StepWeight);
+    auto ByCycles = chainPath(G, /*ByCycles=*/true, CycleWeight);
+    auto BySteps = chainPath(G, /*ByCycles=*/false, StepWeight);
     dbgs() << "amdgpu-global-sched: path by cycles: " << ByCycles.size()
            << " instrs, " << CycleWeight << " cycles\n";
     dbgs() << "amdgpu-global-sched: path by steps: " << BySteps.size()
@@ -675,18 +817,14 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
 
     SmallVector<unsigned, 0> Level;
     DenseMap<const MachineInstr *, unsigned> Depth;
-    for (MachineInstr *MI : orderOf(MF)) {
+    for (MachineInstr *MI : G.Order) {
       Parent.try_emplace(MI, MI);
       unsigned D = 0;
-      if (!MI->isPHI())
-        for (const MachineOperand &MO : MI->uses()) {
-          if (!MO.isReg() || !MO.getReg().isVirtual())
-            continue;
-          MachineInstr *Def = MRI->getVRegDef(MO.getReg());
-          Parent.try_emplace(Def, Def);
-          Parent[Find(Def)] = Find(MI);
-          D = std::max(D, Depth.lookup(Def) + 1);
-        }
+      for (const Dep &P : G.preds(MI)) {
+        Parent.try_emplace(P.Other, P.Other);
+        Parent[Find(P.Other)] = Find(MI);
+        D = std::max(D, Depth.lookup(P.Other) + 1);
+      }
       Depth[MI] = D;
       if (D >= Level.size())
         Level.resize(D + 1);
@@ -714,30 +852,17 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
     SmallVector<MachineInstr *, 0> Work(ByCycles);
     while (!Work.empty()) {
       MachineInstr *MI = Work.pop_back_val();
-      if (MI->isPHI())
-        continue;
-      for (const MachineOperand &MO : MI->uses()) {
-        if (!MO.isReg() || !MO.getReg().isVirtual())
-          continue;
-        MachineInstr *Def = MRI->getVRegDef(MO.getReg());
-        if (!OnPath.count(Def) && Before.insert(Def).second)
-          Work.push_back(Def);
-      }
+      for (const Dep &P : G.preds(MI))
+        if (!OnPath.count(P.Other) && Before.insert(P.Other).second)
+          Work.push_back(P.Other);
     }
 
     Work.assign(ByCycles.begin(), ByCycles.end());
     while (!Work.empty()) {
       MachineInstr *MI = Work.pop_back_val();
-      for (const MachineOperand &MO : MI->defs()) {
-        if (!MO.isReg() || !MO.getReg().isVirtual())
-          continue;
-        for (MachineInstr &Use : MRI->use_nodbg_instructions(MO.getReg())) {
-          if (Use.isPHI())
-            continue;
-          if (!OnPath.count(&Use) && After.insert(&Use).second)
-            Work.push_back(&Use);
-        }
-      }
+      for (const Dep &S : G.succs(MI))
+        if (!OnPath.count(S.Other) && After.insert(S.Other).second)
+          Work.push_back(S.Other);
     }
 
     unsigned Both = count_if(After, [&](auto *MI) { return Before.count(MI); });
@@ -749,7 +874,7 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
     // The step path is the one worth anchoring to: it has the most steps, so
     // it cuts the function into the most regions.
     SmallVector<unsigned, 0> Count, Width;
-    regionsOf(MF, BySteps, Count, Width);
+    regionsOf(G, BySteps, Count, Width);
     unsigned Slots = 0;
     for (unsigned W : Width)
       Slots += W;

@@ -1,0 +1,32 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 -run-pass=amdgpu-global-sched \
+# RUN:     -debug-only=amdgpu-global-sched -o /dev/null %s 2>&1 | FileCheck %s
+# REQUIRES: asserts
+
+# A value written to memory and read back is still a value, and the read is
+# still after the write, but no virtual register says so.
+#
+# On the values alone the write and the read both depend on the address and
+# on nothing else, so they are unordered and the longest run is three. The
+# store-to-load order makes it four. The kinds of memory are kept apart --
+# LDS from everything else -- so a VMEM access in between would not join
+# this chain.
+
+# CHECK: amdgpu-global-sched: path by steps: 4 instrs, 3 steps
+# CHECK: on steps %bb.0 COPY
+# CHECK-NEXT: on steps %bb.0 DS_WRITE_B32_gfx9
+# CHECK-NEXT: on steps %bb.0 DS_READ_B32_gfx9
+# CHECK-NEXT: on steps %bb.0 S_ENDPGM
+
+---
+name:            chain_memory
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $vgpr0
+
+    %0:vgpr_32 = COPY $vgpr0
+    DS_WRITE_B32_gfx9 %0, %0, 0, 0, implicit $exec :: (store (s32), addrspace 3)
+    %1:vgpr_32 = DS_READ_B32_gfx9 %0, 0, 0, implicit $exec :: (load (s32), addrspace 3)
+
+    S_ENDPGM 0, implicit %1
+...
