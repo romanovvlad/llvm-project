@@ -589,6 +589,17 @@ static void cutUntilSmall(const Problem &P, ArrayRef<unsigned> Nodes,
       cutUntilSmall(P, M, Small, Depth + 1, MaxDepth, Leaves);
 }
 
+void llvm::AMDGPUOptSched::spinePieces(
+    const Problem &P, unsigned Limit,
+    SmallVectorImpl<SmallVector<unsigned, 0>> &Out) {
+  SmallVector<unsigned, 0> All(P.size());
+  for (unsigned V = 0, N = P.size(); V != N; ++V)
+    All[V] = V;
+  Out.clear();
+  unsigned MaxDepth = 0;
+  cutUntilSmall(P, All, Limit, 0, MaxDepth, Out);
+}
+
 //===----------------------------------------------------------------------===//
 // Dumping
 //===----------------------------------------------------------------------===//

@@ -90,6 +90,19 @@ static cl::opt<uint64_t> WindowTotalStepLimit(
     cl::desc("Search nodes the windowed solver may expand across a whole "
              "region before it stops sweeping"));
 
+static cl::opt<bool> GatherPieces(
+    "amdgpu-optsched-gather", cl::init(false), cl::Hidden,
+    cl::desc("Between sweeps, move each piece of the region's chain "
+             "decomposition to the cheapest place it may legally go. Reaches "
+             "distances a window cannot. Off: it finds cheaper orders by the "
+             "model and slower ones on hardware, which is a fact about the "
+             "model"));
+
+static cl::opt<uint64_t> GatherStepLimit(
+    "amdgpu-optsched-gather-step-limit", cl::init(200000), cl::Hidden,
+    cl::desc("Placements the gather pass may cost before it stops. One "
+             "placement is one scoring of the whole region"));
+
 static cl::opt<bool> SeedFromSpine(
     "amdgpu-optsched-spine-seed", cl::init(false), cl::Hidden,
     cl::desc("Start the windowed sweep from the order the region's chain "
@@ -656,6 +669,96 @@ void WindowSearch::recurse(unsigned Last, unsigned Reach) {
   }
 }
 
+/// Move whole pieces of the chain decomposition to the best place they can go.
+///
+/// The windowed sweep permutes a fixed number of *consecutive* positions, so
+/// how far an instruction can travel is bounded by the window and the number
+/// of passes, and every step of the way has to pay for itself. That is the
+/// wrong shape for what the decomposition finds: on the hot _attn_fwd block
+/// only 5 of 19 pieces are already consecutive, and one sixteen-instruction
+/// piece is spread over 533 positions. No sweep sixteen wide closes that.
+///
+/// A piece is convex, so it may always be lifted out and put back down as a
+/// block, and the places it may be put down are an interval -- after the last
+/// instruction outside it that it depends on, before the first that depends on
+/// it. Each is tried and the whole order is costed the way the driver will
+/// cost it, so this cannot make a region worse; it can only cost time.
+///
+/// Members keep the relative order they already had. Ordering within a piece
+/// is the sweep's job and it is good at it; what it cannot do is carry the
+/// piece.
+///
+/// \returns true if \p Order changed.
+static bool gatherPieces(const Problem &P, SmallVectorImpl<unsigned> &Order,
+                         Cost &Best, ArrayRef<SmallVector<unsigned, 0>> Pieces,
+                         uint64_t &Budget) {
+  const unsigned N = P.size();
+  bool Changed = false;
+
+  SmallVector<unsigned, 0> Pos(N, 0);
+  SmallVector<bool, 0> InPiece(N, false);
+  SmallVector<unsigned, 0> Kept, Moved, Trial, BestOrder;
+
+  for (ArrayRef<unsigned> Pc : Pieces) {
+    if (Pc.size() < 2 || Budget == 0)
+      continue;
+    for (auto [I, V] : enumerate(Order))
+      Pos[V] = I;
+    for (unsigned V : Pc)
+      InPiece[V] = true;
+
+    // Lift the piece out, remembering the members in the order they were in.
+    Kept.clear();
+    Moved.assign(Pc.begin(), Pc.end());
+    llvm::sort(Moved, [&](unsigned A, unsigned B) { return Pos[A] < Pos[B]; });
+    for (unsigned V : Order)
+      if (!InPiece[V])
+        Kept.push_back(V);
+
+    // Where it may be put back. Direct edges are enough: a path out of the
+    // piece leaves it through one edge, and that edge's other end is counted
+    // here, so a transitive constraint is never looser than a direct one.
+    unsigned Lo = 0, Hi = Kept.size();
+    SmallVector<unsigned, 0> KeptPos(N, 0);
+    for (auto [I, V] : enumerate(Kept))
+      KeptPos[V] = I;
+    for (unsigned V : Pc) {
+      for (unsigned EI : P.predEdgesOf(V)) {
+        unsigned U = P.edges()[EI].Pred;
+        if (!InPiece[U])
+          Lo = std::max(Lo, KeptPos[U] + 1);
+      }
+      for (unsigned EI : P.succEdgesOf(V)) {
+        unsigned W = P.edges()[EI].Succ;
+        if (!InPiece[W])
+          Hi = std::min(Hi, KeptPos[W]);
+      }
+    }
+
+    BestOrder.clear();
+    for (unsigned At = Lo; At <= Hi && Budget; ++At) {
+      --Budget;
+      Trial.clear();
+      Trial.append(Kept.begin(), Kept.begin() + At);
+      Trial.append(Moved.begin(), Moved.end());
+      Trial.append(Kept.begin() + At, Kept.end());
+      Cost C = P.costOf(Trial);
+      if (C < Best) {
+        Best = C;
+        BestOrder = Trial;
+      }
+    }
+    if (!BestOrder.empty()) {
+      Order.assign(BestOrder.begin(), BestOrder.end());
+      Changed = true;
+    }
+
+    for (unsigned V : Pc)
+      InPiece[V] = false;
+  }
+  return Changed;
+}
+
 class WindowSolver : public Solver {
   unsigned Width;
   unsigned Passes;
@@ -712,8 +815,23 @@ Answer WindowSolver::solve(const Problem &P) {
     SmallVector<unsigned, 0> UsesLeft;
     SmallVector<unsigned, 0> Trial;
 
+    // The pieces are a property of the dependence graph, so they are the same
+    // whatever order the sweep has reached; only where they sit changes.
+    SmallVector<SmallVector<unsigned, 0>, 0> Pieces;
+    uint64_t GatherLeft = GatherStepLimit;
+    bool Gathered = false;
+    if (GatherPieces)
+      spinePieces(P, Width, Pieces);
+
     for (unsigned Pass = 0; Pass != Passes && !OutOfBudget; ++Pass) {
       bool Changed = false;
+
+      // Carry the pieces first, then let the sweep settle what they land next
+      // to. The two moves are complements: this one is long and coarse, the
+      // sweep is short and exact, and neither reaches the other's distance.
+      if (GatherPieces &&
+          gatherPieces(P, A.Order, BestCost, Pieces, GatherLeft))
+        Gathered = Changed = true;
 
       // Start the sweep over. The order may have changed under it, and the
       // state is relative to a position in a particular order.
@@ -787,6 +905,8 @@ Answer WindowSolver::solve(const Problem &P) {
       if (!Changed)
         break;
     }
+    if (Gathered)
+      A.Solver = A.Solver == "window" ? "window+gather" : "window+gather+spine";
   }
 
   P.timeOrder(A.Order, A.Cycles);

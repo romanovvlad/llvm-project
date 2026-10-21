@@ -504,6 +504,20 @@ Width countOrders(const Problem &P, ArrayRef<unsigned> Nodes,
 /// want each instruction, and says nothing about registers.
 void spineOrder(const Problem &P, SmallVectorImpl<unsigned> &Out);
 
+/// The region cut into pieces small enough to search: the longest chain, then
+/// each gap it leaves cut the same way, until a piece holds at most \p Limit
+/// instructions or stops getting smaller.
+///
+/// Every piece is convex -- nothing outside it is ordered between two of its
+/// members -- so a piece may always be gathered into consecutive positions,
+/// and the positions it may be gathered at are an interval. That is what makes
+/// it something a search can move, rather than only something to look at.
+///
+/// The chain instructions themselves are not pieces. They are what the pieces
+/// are measured against.
+void spinePieces(const Problem &P, unsigned Limit,
+                 SmallVectorImpl<SmallVector<unsigned, 0>> &Out);
+
 /// How much is actually known about an answer.
 ///
 /// These are not decoration. `Optimal` is a claim that no legal schedule is
