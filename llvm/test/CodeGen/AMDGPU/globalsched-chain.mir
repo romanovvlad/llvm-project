@@ -15,7 +15,7 @@
 # a PHI, so dropping the edges into PHIs leaves a DAG, and what is left is the
 # chain through one iteration -- which is the one that is paid per trip.
 
-# CHECK: amdgpu-global-sched: chain: 6 instrs, 4 cycles, 5 on the chain
+# CHECK: amdgpu-global-sched: chain: 6 instrs, 4 cycles, 5 critical
 
 # CHECK-DAG: amdgpu-global-sched:   %bb.0 COPY start 0 slack 0
 # CHECK-DAG: amdgpu-global-sched:   %bb.0 V_ADD_U32_e32 start 1 slack 0

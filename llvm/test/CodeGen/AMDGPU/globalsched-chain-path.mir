@@ -1,0 +1,50 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 -run-pass=amdgpu-global-sched \
+# RUN:     -debug-only=amdgpu-global-sched -o /dev/null %s 2>&1 | FileCheck %s
+# REQUIRES: asserts
+
+# The chain is a path, not a set.
+#
+# "Critical" counts every instruction with no slack, which is the union of all
+# the longest paths and is routinely bigger than any one of them. A chain has
+# to be a run of instructions each reading what the one before it defines,
+# because that is what it means that they cannot be exchanged.
+#
+# There are two longest paths here and they are different paths:
+#
+#   %0 -> %1 -> %2            a load, so three instructions and ~82 cycles
+#   %3 -> %4 -> ... -> %8     six adds, so six instructions and six cycles
+#
+# Weighted by latency the load wins; weighted by one per step the adds do.
+# Scheduling cares about the first -- it is the floor under the makespan --
+# but the second is the longer run of instructions that has to stay in the
+# order it is in.
+
+# CHECK: amdgpu-global-sched: path by cycles: 4 instrs, 82 cycles
+# CHECK: amdgpu-global-sched: path by steps: 7 instrs, 6 steps
+
+# The cycle path runs through the load, not through the adds.
+# CHECK: on path %bb.0 COPY
+# CHECK-NEXT: on path %bb.0 GLOBAL_LOAD_DWORD
+# CHECK-NEXT: on path %bb.0 V_ADD_U32_e32
+# CHECK-NEXT: on path %bb.0 S_ENDPGM
+
+---
+name:            chain_path
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $vgpr0, $vgpr2_vgpr3
+
+    %0:vreg_64_align2 = COPY $vgpr2_vgpr3
+    %1:vgpr_32 = GLOBAL_LOAD_DWORD %0, 0, 0, implicit $exec :: (load (s32))
+    %2:vgpr_32 = V_ADD_U32_e32 %1, %1, implicit $exec
+
+    %3:vgpr_32 = COPY $vgpr0
+    %4:vgpr_32 = V_ADD_U32_e32 %3, %3, implicit $exec
+    %5:vgpr_32 = V_ADD_U32_e32 %4, %4, implicit $exec
+    %6:vgpr_32 = V_ADD_U32_e32 %5, %5, implicit $exec
+    %7:vgpr_32 = V_ADD_U32_e32 %6, %6, implicit $exec
+    %8:vgpr_32 = V_ADD_U32_e32 %7, %7, implicit $exec
+
+    S_ENDPGM 0, implicit %2, implicit %8
+...

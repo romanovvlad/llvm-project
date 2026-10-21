@@ -12,7 +12,7 @@
 # Charging its latency to the chain would report 500 cycles for every function
 # containing a barrier, which is what this test is here to catch.
 
-# CHECK: amdgpu-global-sched: chain: 4 instrs, 2 cycles, 3 on the chain
+# CHECK: amdgpu-global-sched: chain: 4 instrs, 2 cycles, 3 critical
 # CHECK-DAG: amdgpu-global-sched:   %bb.0 S_BARRIER start 0 slack 2 lat 0
 
 ---

@@ -111,6 +111,16 @@ private:
   /// Which block of \p P to schedule into.
   MachineBasicBlock *chooseBlock(const Placement &P) const;
 
+  /// Every instruction of \p MF in a topological order of its dependences.
+  SmallVector<MachineInstr *, 0> orderOf(MachineFunction &MF) const;
+
+  /// One longest path through the dependence graph, and its weight in \p
+  /// Weight. \p ByCycles weighs an edge by its latency, giving the critical
+  /// path; otherwise each edge weighs one, giving the longest run of
+  /// instructions that cannot be exchanged with each other.
+  SmallVector<MachineInstr *, 0> chainPath(MachineFunction &MF, bool ByCycles,
+                                           unsigned &Weight) const;
+
   /// Earliest and latest start time of each instruction, in cycles, as the
   /// dependence graph alone allows. Fills \p Start and \p Slack and returns
   /// the length of the longest chain.
@@ -319,9 +329,8 @@ Placement AMDGPUGlobalSchedImpl::intervalOf(MachineInstr &MI) const {
   return P;
 }
 
-unsigned AMDGPUGlobalSchedImpl::chainOf(
-    MachineFunction &MF, DenseMap<const MachineInstr *, unsigned> &Start,
-    DenseMap<const MachineInstr *, unsigned> &Slack) const {
+SmallVector<MachineInstr *, 0>
+AMDGPUGlobalSchedImpl::orderOf(MachineFunction &MF) const {
   // Reverse post-order over blocks, program order inside one, is a topological
   // order of the SSA dependence graph: a definition's block dominates every
   // use's, and dominance implies precedence in reverse post-order. The one
@@ -335,6 +344,68 @@ unsigned AMDGPUGlobalSchedImpl::chainOf(
     for (MachineInstr &MI : *MBB)
       if (!MI.isDebugInstr())
         Order.push_back(&MI);
+  return Order;
+}
+
+SmallVector<MachineInstr *, 0>
+AMDGPUGlobalSchedImpl::chainPath(MachineFunction &MF, bool ByCycles,
+                                 unsigned &Weight) const {
+  // A longest path, recovered by remembering which operand was the one that
+  // made each instruction wait. Every step of the result reads a value the
+  // step before it defines, so no two instructions on it may be exchanged --
+  // which is what distinguishes a path from the set of instructions with no
+  // slack. That set is the union of all the critical paths, and is routinely
+  // larger than any one of them.
+  //
+  // With \p ByCycles an edge weighs what it costs, and the answer is the
+  // critical path: the floor under any schedule. Otherwise every edge weighs
+  // one and the answer is the most instructions that are pairwise ordered --
+  // the longest run that has to stay in the order it is in, whatever it costs.
+  DenseMap<const MachineInstr *, unsigned> Depth;
+  DenseMap<const MachineInstr *, MachineInstr *> Prev;
+
+  MachineInstr *End = nullptr;
+  Weight = 0;
+  for (MachineInstr *MI : orderOf(MF)) {
+    unsigned D = 0;
+    MachineInstr *From = nullptr;
+    if (!MI->isPHI()) {
+      for (const MachineOperand &MO : MI->uses()) {
+        if (!MO.isReg() || !MO.getReg().isVirtual())
+          continue;
+        MachineInstr *Def = MRI->getVRegDef(MO.getReg());
+        auto It = Depth.find(Def);
+        if (It == Depth.end())
+          continue;
+        unsigned Edge = ByCycles ? latencyBetween(*Def, *MI, MO) : 1;
+        if (It->second + Edge >= D) {
+          D = It->second + Edge;
+          From = Def;
+        }
+      }
+    }
+    Depth[MI] = D;
+    Prev[MI] = From;
+    // An instruction nobody waits for still ends a path, but only its own
+    // tail counts past the last edge -- see tailOf.
+    unsigned Full = D + (ByCycles ? tailOf(*MI) : 0);
+    if (Full >= Weight) {
+      Weight = Full;
+      End = MI;
+    }
+  }
+
+  SmallVector<MachineInstr *, 0> Path;
+  for (MachineInstr *MI = End; MI; MI = Prev.lookup(MI))
+    Path.push_back(MI);
+  std::reverse(Path.begin(), Path.end());
+  return Path;
+}
+
+unsigned AMDGPUGlobalSchedImpl::chainOf(
+    MachineFunction &MF, DenseMap<const MachineInstr *, unsigned> &Start,
+    DenseMap<const MachineInstr *, unsigned> &Slack) const {
+  SmallVector<MachineInstr *, 0> Order = orderOf(MF);
 
   // Forwards: the earliest an instruction can start is when its last operand
   // is ready.
@@ -497,7 +568,21 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
     unsigned OnChain =
         count_if(Found, [&](auto &P) { return Slack.lookup(P.first) == 0; });
     dbgs() << "amdgpu-global-sched: chain: " << NumInstrs << " instrs, "
-           << Length << " cycles, " << OnChain << " on the chain\n";
+           << Length << " cycles, " << OnChain << " critical\n";
+
+    // Two different longest paths, and they are rarely the same one.
+    unsigned CycleWeight = 0, StepWeight = 0;
+    auto ByCycles = chainPath(MF, /*ByCycles=*/true, CycleWeight);
+    auto BySteps = chainPath(MF, /*ByCycles=*/false, StepWeight);
+    dbgs() << "amdgpu-global-sched: path by cycles: " << ByCycles.size()
+           << " instrs, " << CycleWeight << " cycles\n";
+    dbgs() << "amdgpu-global-sched: path by steps: " << BySteps.size()
+           << " instrs, " << StepWeight << " steps\n";
+    for (MachineInstr *MI : ByCycles)
+      dbgs() << "amdgpu-global-sched:   on path "
+             << printMBBReference(*MI->getParent()) << " "
+             << TII->getName(MI->getOpcode()) << " at " << Start.lookup(MI)
+             << "\n";
     for (auto &[MI, P] : Found)
       dbgs() << "amdgpu-global-sched:   " << printMBBReference(*P.Home) << " "
              << TII->getName(MI->getOpcode()) << " start " << Start.lookup(MI)
