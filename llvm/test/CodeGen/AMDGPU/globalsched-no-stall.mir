@@ -1,0 +1,45 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 -run-pass=amdgpu-global-sched \
+# RUN:     -debug-only=amdgpu-global-sched -o /dev/null %s 2>&1 | FileCheck %s
+# REQUIRES: asserts
+
+# Dependence says where an instruction may go. It says nothing about when.
+#
+# Each step of the path issues at a known cycle, so each region spans a known
+# stretch of time. An instruction has a known stretch of its own: it cannot
+# start before its operands are ready, and starting it after its consumers
+# need it pushes the end of the function out. Where those two stretches do
+# not meet, the region is legal and costs a stall anyway.
+#
+# Here the path is the four-add chain into the end, so there are seven
+# regions, each one cycle long. The side chain is three adds, and each of
+# them is legal in five of the seven -- but each is ready only once the one
+# before it has run, so only two of the five cost nothing, and the rest cost
+# exactly as many cycles as they are away from the ones that do.
+
+# CHECK: amdgpu-global-sched: regions: 7 regions, 3 to place, 15 legal slots, 5 regions each
+# CHECK: amdgpu-global-sched: no stall: 6 of 15 regions, 6 of 15 slots, 0 with one region, 0 with none
+
+# CHECK: slots V_ADD_U32_e32 ready 1 due 2: r1 +1 r2 0..0 r3 0..0 r4 +1 r5 +2
+# CHECK-NEXT: slots V_ADD_U32_e32 ready 2 due 3: r1 +2 r2 +1 r3 0..0 r4 0..0 r5 +1
+# CHECK-NEXT: slots V_ADD_U32_e32 ready 3 due 4: r1 +3 r2 +2 r3 +1 r4 0..0 r5 0..0
+
+---
+name:            no_stall
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $vgpr0
+
+    %0:vgpr_32 = COPY $vgpr0
+
+    %1:vgpr_32 = V_ADD_U32_e32 %0, %0, implicit $exec
+    %2:vgpr_32 = V_ADD_U32_e32 %1, %1, implicit $exec
+    %3:vgpr_32 = V_ADD_U32_e32 %2, %2, implicit $exec
+    %4:vgpr_32 = V_ADD_U32_e32 %3, %3, implicit $exec
+
+    %5:vgpr_32 = V_ADD_U32_e32 %0, %0, implicit $exec
+    %6:vgpr_32 = V_ADD_U32_e32 %5, %5, implicit $exec
+    %7:vgpr_32 = V_ADD_U32_e32 %6, %6, implicit $exec
+
+    S_ENDPGM 0, implicit %4, implicit %7
+...

@@ -119,6 +119,60 @@ private:
   }
 };
 
+/// When everything could run if the only thing anybody ever waited for was
+/// a value. \p Start is the earliest cycle an instruction may issue, \p Slack
+/// how much later it may issue without pushing \p Length out, and \p Length
+/// the longest chain in the function.
+struct Timing {
+  DenseMap<const MachineInstr *, unsigned> Start, Slack;
+  unsigned Length = 0;
+};
+
+/// Where one instruction not on the path may go. \p First and \p Last are
+/// the regions dependence allows it into, inclusive, and \p Here is the one
+/// it is in now. \p Asap and \p Alap are the earliest and the latest cycle it
+/// may issue at without anybody waiting for it or it waiting for anybody.
+struct Window {
+  MachineInstr *MI;
+  unsigned First, Last, Here, Asap, Alap;
+};
+
+/// The function cut into regions by a path, and what may go where.
+struct Regions {
+  SmallVector<unsigned, 0> Count;      ///< how many instructions each allows
+  SmallVector<unsigned, 0> Begin, End; ///< the cycles each region spans
+  SmallVector<Window, 0> Wins;         ///< one per instruction not on the path
+
+  unsigned size() const { return Count.size(); }
+
+  /// How many instructions region \p R has room for. The machine issues one
+  /// instruction a cycle, so a region holds as many as it is long.
+  unsigned cap(unsigned R) const { return std::max(End[R] - Begin[R], 1u); }
+
+  /// What putting \p W at slot \p Slot of region \p R costs: the cycles spent
+  /// waiting for its operands, plus the cycles its consumers then wait. Zero
+  /// when the slot falls inside the instruction's own window.
+  unsigned costAt(const Window &W, unsigned R, unsigned Slot) const {
+    unsigned At = Begin[R] + Slot;
+    return (W.Asap > At ? W.Asap - At : 0) + (At > W.Alap ? At - W.Alap : 0);
+  }
+
+  /// The slots of region \p R that cost \p W nothing, first and last. The
+  /// range is empty, first past last, when none of them do.
+  std::pair<int64_t, int64_t> freeIn(const Window &W, unsigned R) const {
+    int64_t Lo = std::max<int64_t>((int64_t)W.Asap - Begin[R], 0);
+    int64_t Hi = std::min<int64_t>((int64_t)W.Alap - Begin[R], cap(R) - 1);
+    return {Lo, Hi};
+  }
+
+  /// The cheapest slot of region \p R for \p W, and what it costs.
+  std::pair<unsigned, unsigned> bestIn(const Window &W, unsigned R) const {
+    auto [Lo, Hi] = freeIn(W, R);
+    int64_t Slot = Lo <= Hi ? Lo : (Lo > (int64_t)cap(R) - 1 ? cap(R) - 1 : 0);
+    return {(unsigned)Slot, costAt(W, R, (unsigned)Slot)};
+  }
+};
+
 /// What a step of a path is worth.
 ///
 /// Cycles weighs an edge by its latency, so the longest path is the critical
@@ -184,21 +238,16 @@ private:
                                            unsigned &Weight) const;
 
   /// A path of N instructions cuts the function into N+1 regions: one before
-  /// each step and one after the last. \p Count is filled with how many of
-  /// the instructions not on \p Path dependence allows into each region, and
-  /// \p Width with how many regions each such instruction is allowed into,
-  /// and \p Here with the region each one is in now.
+  /// each step and one after the last. Fills \p R with how big each region
+  /// is, in instructions and in cycles, and with one Window per instruction
+  /// not on \p Path saying where that instruction may go.
   void regionsOf(const DepGraph &G, ArrayRef<MachineInstr *> Path,
-                 SmallVectorImpl<unsigned> &Count,
-                 SmallVectorImpl<unsigned> &Width,
-                 SmallVectorImpl<unsigned> &Here) const;
+                 const Timing &T, Regions &R) const;
 
   /// Earliest and latest start time of each instruction, in cycles, as \p G
   /// alone allows. Fills \p Start and \p Slack and returns the length of the
   /// longest chain.
-  unsigned chainOf(const DepGraph &G,
-                   DenseMap<const MachineInstr *, unsigned> &Start,
-                   DenseMap<const MachineInstr *, unsigned> &Slack) const;
+  void chainOf(const DepGraph &G, Timing &T) const;
 
   /// Put \p MI into \p To, in a position that reads nothing defined after it.
   void place(MachineInstr &MI, MachineBasicBlock &To) const;
@@ -593,9 +642,7 @@ AMDGPUGlobalSchedImpl::chainPath(const DepGraph &G, Weigh How,
 
 void AMDGPUGlobalSchedImpl::regionsOf(const DepGraph &G,
                                       ArrayRef<MachineInstr *> Path,
-                                      SmallVectorImpl<unsigned> &Count,
-                                      SmallVectorImpl<unsigned> &Width,
-                                      SmallVectorImpl<unsigned> &Here) const {
+                                      const Timing &T, Regions &R) const {
   // Number the steps of the path, and the N+1 regions between them, so that
   // region I is the gap immediately before step I and region N is what comes
   // after the last step.
@@ -604,9 +651,18 @@ void AMDGPUGlobalSchedImpl::regionsOf(const DepGraph &G,
     Step[MI] = I;
   const int N = Path.size();
 
-  Count.assign(N + 1, 0);
-  Width.clear();
-  Here.clear();
+  R.Count.assign(N + 1, 0);
+  R.Wins.clear();
+
+  // Where the path is in time. Region I is the stretch between the issue of
+  // the step before it and the issue of the step after it; the last region
+  // runs to the end of the chain.
+  R.Begin.assign(N + 1, 0);
+  R.End.assign(N + 1, 0);
+  for (int I = 0; I <= N; ++I) {
+    R.Begin[I] = I == 0 ? 0 : T.Start.lookup(Path[I - 1]);
+    R.End[I] = I == N ? T.Length : T.Start.lookup(Path[I]);
+  }
 
   // The last step that has to come before an instruction. If a predecessor is
   // a step, that step does; otherwise whatever had to precede it does.
@@ -633,29 +689,29 @@ void AMDGPUGlobalSchedImpl::regionsOf(const DepGraph &G,
 
   // An instruction may sit anywhere after the last step it needs and before
   // the first step that needs it. That window is a run of whole regions, and
-  // it is never empty, since the path is a path.
-  // G.Order is the schedule the function has now, so counting the steps
-  // already gone past says which region an instruction is in today.
+  // it is never empty, since the path is a path. G.Order is the schedule the
+  // function has now, so counting the steps already gone past says which
+  // region an instruction is in today.
   unsigned Past = 0;
   for (MachineInstr *MI : G.Order) {
     if (Step.count(MI)) {
       ++Past;
       continue;
     }
-    int First = Lo.lookup(MI) + 1, Last = Hi.lookup(MI);
-    Width.push_back(Last - First + 1);
-    Here.push_back(Past);
-    for (int I = First; I <= Last; ++I)
-      ++Count[I];
+    unsigned First = Lo.lookup(MI) + 1, Last = Hi.lookup(MI);
+    unsigned Asap = T.Start.lookup(MI);
+    R.Wins.push_back({MI, First, Last, Past, Asap, Asap + T.Slack.lookup(MI)});
+    for (unsigned I = First; I <= Last; ++I)
+      ++R.Count[I];
   }
 }
 
-unsigned AMDGPUGlobalSchedImpl::chainOf(
-    const DepGraph &G, DenseMap<const MachineInstr *, unsigned> &Start,
-    DenseMap<const MachineInstr *, unsigned> &Slack) const {
+void AMDGPUGlobalSchedImpl::chainOf(const DepGraph &G, Timing &T) const {
+  auto &Start = T.Start;
+  auto &Slack = T.Slack;
+  unsigned &Length = T.Length;
   // Forwards: the earliest an instruction can start is when the last thing it
   // waits for is ready.
-  unsigned Length = 0;
   for (MachineInstr *MI : G.Order) {
     unsigned S = 0;
     for (const Dep &P : G.preds(MI))
@@ -681,8 +737,6 @@ unsigned AMDGPUGlobalSchedImpl::chainOf(
         DI->second = std::min(DI->second, Want);
     }
   }
-
-  return Length;
 }
 
 MachineBasicBlock *
@@ -796,8 +850,11 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
   DepGraph G;
   buildDeps(MF, G);
 
-  DenseMap<const MachineInstr *, unsigned> Start, Slack;
-  unsigned Length = chainOf(G, Start, Slack);
+  Timing T;
+  chainOf(G, T);
+  auto &Start = T.Start;
+  auto &Slack = T.Slack;
+  unsigned Length = T.Length;
 
   LLVM_DEBUG({
     unsigned OnChain =
@@ -893,37 +950,88 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
     // arithmetic cuts nothing -- nothing else in the function is ordered
     // against it. A sequence point is ordered against everything in its
     // block, so each one on the path is a real wall.
-    SmallVector<unsigned, 0> Count, Width, Here;
-    regionsOf(G, ByControl, Count, Width, Here);
-    unsigned Slots = 0;
-    for (unsigned W : Width)
-      Slots += W;
-    dbgs() << "amdgpu-global-sched: regions: " << Count.size() << " regions, "
-           << Width.size() << " to place, " << Slots << " legal slots, "
-           << (Width.empty() ? 0 : Slots / Width.size()) << " regions each\n";
-    // How big the problem is. Choosing a region for each instruction costs
-    // the log of the product of the window widths; ordering what lands in a
-    // region costs the log of the factorial of what is in it. In bits, so
-    // they add, and so the number stays readable at any size.
-    double Place = 0;
-    for (unsigned W : Width)
-      Place += std::log2(W);
-    SmallVector<unsigned, 0> Busy(Count.size(), 0);
-    for (unsigned R : Here)
-      ++Busy[R];
+    Regions R;
+    regionsOf(G, ByControl, T, R);
+
+    // Three ways of counting the same thing, each narrower than the last.
+    // A region slot is one instruction in one region, ignoring time. A cycle
+    // slot is one instruction at one issue cycle of one region. And of those,
+    // only some cost nothing at all.
+    unsigned Slots = 0, Open = 0, Cycles = 0, Free = 0;
+    double Place = 0, Narrow = 0;
+    unsigned Forced = 0, Nowhere = 0;
+    SmallVector<unsigned, 0> Busy(R.size(), 0);
+    for (const Window &W : R.Wins) {
+      ++Busy[W.Here];
+      Slots += W.Last - W.First + 1;
+      unsigned Fits = 0, Here = 0;
+      for (unsigned I = W.First; I <= W.Last; ++I) {
+        Cycles += R.cap(I);
+        auto [Lo, Hi] = R.freeIn(W, I);
+        if (Lo > Hi)
+          continue;
+        ++Fits;
+        Here += Hi - Lo + 1;
+      }
+      Open += Fits;
+      Free += Here;
+      Place += std::log2(W.Last - W.First + 1);
+      Narrow += std::log2(std::max(Here, 1u));
+      Forced += Fits == 1;
+      Nowhere += Fits == 0;
+    }
+
     double Order = 0;
     unsigned Worst = 0;
     for (unsigned B : Busy) {
       Order += std::lgamma(B + 1.0) / std::log(2.0);
       Worst = std::max(Worst, B);
     }
-    for (auto [I, C] : enumerate(Count))
+
+    unsigned Num = R.Wins.size();
+    dbgs() << "amdgpu-global-sched: regions: " << R.size() << " regions, "
+           << Num << " to place, " << Slots << " legal slots, "
+           << (Num ? Slots / Num : 0) << " regions each\n";
+    for (auto [I, C] : enumerate(R.Count))
       dbgs() << "amdgpu-global-sched:   region " << I << ": " << C << " legal, "
-             << Busy[I] << " now\n";
+             << Busy[I] << " now, " << R.cap(I) << " cycles\n";
+
+    // Of the legal places, the ones that cost nothing. Dependence says where
+    // an instruction may go; this says where it may go without waiting, and
+    // it is a much smaller place.
+    dbgs() << "amdgpu-global-sched: no stall: " << Open << " of " << Slots
+           << " regions, " << Free << " of " << Cycles << " slots, " << Forced
+           << " with one region, " << Nowhere << " with none\n";
+
+    // How big the problem is. Choosing a place for each instruction costs the
+    // log of the product of the choices; ordering what lands in a region
+    // costs the log of the factorial of what is in it. In bits, so they add,
+    // and so the number stays readable at any size.
     dbgs() << "amdgpu-global-sched: search: " << (uint64_t)std::llround(Place)
            << " bits to place, " << (uint64_t)std::llround(Order)
            << " to order, " << (uint64_t)std::llround(Place + Order)
-           << " total, largest region " << Worst << "\n";
+           << " total, largest region " << Worst << ", "
+           << (uint64_t)std::llround(Narrow) << " bits without a stall\n";
+
+    // And what each choice costs. A slot of a region issues at a known cycle,
+    // so putting an instruction there has a price that can be read off before
+    // any search begins: how long the machine waits for its operands, plus
+    // how long its consumers then wait for it.
+    for (const Window &W : R.Wins) {
+      dbgs() << "amdgpu-global-sched:   slots "
+             << TII->getName(W.MI->getOpcode()) << " ready " << W.Asap
+             << " due " << W.Alap << ":";
+      for (unsigned I = W.First; I <= W.Last; ++I) {
+        auto [Lo, Hi] = R.freeIn(W, I);
+        dbgs() << " r" << I;
+        if (Lo <= Hi) {
+          dbgs() << " " << Lo << ".." << Hi;
+          continue;
+        }
+        dbgs() << " +" << R.bestIn(W, I).second;
+      }
+      dbgs() << "\n";
+    }
 
     for (MachineInstr *MI : ByCycles)
       dbgs() << "amdgpu-global-sched:   on path "
