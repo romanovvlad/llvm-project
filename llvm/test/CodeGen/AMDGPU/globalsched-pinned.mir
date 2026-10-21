@@ -1,0 +1,55 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 -run-pass=amdgpu-global-sched \
+# RUN:     -verify-machineinstrs -o - %s | FileCheck %s
+
+# The same shape as globalsched-sink-to-use.mir, but with instructions that are
+# not pure. Every one of them is read only in bb.2, so the dominance argument
+# alone would put all three there. None of them may go, and the reasons are
+# three separate mechanisms rather than one rule:
+#
+#   - the store is not a value computation at all, so moving it changes when
+#     memory is written;
+#   - V_READFIRSTLANE reads across lanes, so what it returns is a function of
+#     EXEC and of which block asks;
+#   - SCC is one bit, and nothing in the backend tracks its liveness between
+#     blocks, so a second SCC definition anywhere in between would silently
+#     take over.
+
+---
+name:            pinned
+tracksRegLiveness: true
+body:             |
+  ; CHECK-LABEL: name: pinned
+
+  ; CHECK: bb.0:
+  ; CHECK: GLOBAL_STORE_DWORD
+  ; CHECK: V_READFIRSTLANE_B32
+  ; CHECK: S_ADD_I32
+
+  bb.0:
+    successors: %bb.1
+    liveins: $vgpr0, $vgpr2_vgpr3
+
+    %0:vgpr_32 = COPY $vgpr0
+    %1:vreg_64_align2 = COPY $vgpr2_vgpr3
+    GLOBAL_STORE_DWORD %1, %0, 0, 0, implicit $exec
+    %2:sreg_32_xm0 = V_READFIRSTLANE_B32 %0, implicit $exec
+    %3:sreg_32 = S_ADD_I32 1, 2, implicit-def $scc
+
+  ; CHECK: bb.1:
+  ; CHECK-NOT: GLOBAL_STORE_DWORD
+  ; CHECK-NOT: V_READFIRSTLANE_B32
+  ; CHECK-NOT: S_ADD_I32
+
+  bb.1:
+    successors: %bb.2
+
+    S_NOP 0
+
+  ; CHECK: bb.2:
+  ; CHECK-NOT: GLOBAL_STORE_DWORD
+  ; CHECK-NOT: V_READFIRSTLANE_B32
+  ; CHECK-NOT: S_ADD_I32
+
+  bb.2:
+    S_ENDPGM 0, implicit %2, implicit %3
+...

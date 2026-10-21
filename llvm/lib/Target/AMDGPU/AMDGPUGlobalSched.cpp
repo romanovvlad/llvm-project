@@ -36,8 +36,11 @@
 /// is not one rule but a list of separate mechanisms, and it is written out
 /// in classify() below.
 ///
-/// This file currently computes those intervals and prints them. It does not
-/// move anything.
+/// The block chosen out of the interval is currently the one that runs least
+/// often, ties going to the latest. That is a placement rule, not the
+/// objective; the objective, and a search that uses it, come later.
+///
+/// Live intervals are not maintained, so the pass is not yet in the pipeline.
 //
 //===----------------------------------------------------------------------===//
 
@@ -102,8 +105,16 @@ private:
   /// classify() returned null.
   Placement intervalOf(MachineInstr &MI) const;
 
-  static unsigned levelOf(const MachineDomTreeNode *N) {
-    return N->getLevel();
+  /// Which block of \p P to schedule into.
+  MachineBasicBlock *chooseBlock(const Placement &P) const;
+
+  /// Put \p MI into \p To, in a position that reads nothing defined after it.
+  void place(MachineInstr &MI, MachineBasicBlock &To) const;
+
+  static unsigned levelOf(const MachineDomTreeNode *N) { return N->getLevel(); }
+
+  unsigned depthOf(const MachineBasicBlock *MBB) const {
+    return CI.getCycleDepth(MBB);
   }
 };
 
@@ -260,6 +271,55 @@ Placement AMDGPUGlobalSchedImpl::intervalOf(MachineInstr &MI) const {
   return P;
 }
 
+MachineBasicBlock *
+AMDGPUGlobalSchedImpl::chooseBlock(const Placement &P) const {
+  // Walk the interval from its latest end towards its earliest, and take the
+  // block that runs least often. Picking a block inside a loop costs its trip
+  // count, which is what makes a loop-invariant value end up outside without
+  // anything here knowing the phrase. Ties go to the latest block, since that
+  // is the schedule in which the value is live across the fewest blocks.
+  MachineBasicBlock *Best = P.Hi;
+  unsigned BestDepth = depthOf(P.Hi);
+  for (MachineDomTreeNode *N = DT.getNode(P.Hi); N->getBlock() != P.Lo;
+       N = N->getIDom()) {
+    MachineBasicBlock *B = N->getIDom()->getBlock();
+    if (unsigned D = depthOf(B); D < BestDepth) {
+      Best = B;
+      BestDepth = D;
+    }
+  }
+  return Best;
+}
+
+void AMDGPUGlobalSchedImpl::place(MachineInstr &MI,
+                                  MachineBasicBlock &To) const {
+  Register Reg;
+  for (const MachineOperand &MO : MI.operands())
+    if (MO.isReg() && MO.isDef())
+      Reg = MO.getReg();
+
+  // Ahead of the first reader already in the block, or at the end if there is
+  // none. A reader cannot be a PHI, because a PHI reads on its incoming edge,
+  // so To would have had to be a predecessor of the PHI's block rather than
+  // the block itself.
+  MachineBasicBlock::iterator At = To.getFirstTerminator();
+  for (MachineInstr &Other : To) {
+    if (!Other.readsRegister(Reg, nullptr))
+      continue;
+    assert(!Other.isPHI() && "a PHI reads on its edge, not in its own block");
+    At = Other.getIterator();
+    break;
+  }
+
+  To.splice(At, MI.getParent(), MI.getIterator());
+
+  // The value now reaches a different set of program points, so whatever the
+  // old last reader was is no longer necessarily the last one.
+  for (const MachineOperand &MO : MI.operands())
+    if (MO.isReg() && MO.isUse() && MO.getReg().isVirtual())
+      MRI->clearKillFlags(MO.getReg());
+}
+
 bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
   const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
   TII = ST.getInstrInfo();
@@ -318,8 +378,25 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
     }
   });
 
-  // Nothing is placed yet.
-  return false;
+  // Emit back to front. An instruction is placed ahead of its first reader in
+  // the block it lands in, so every reader has to have landed already; reverse
+  // program order gives that, because a reader never precedes what it reads.
+  bool Changed = false;
+  for (auto &[MI, P] : reverse(Found)) {
+    if (!P.isFree())
+      continue;
+    MachineBasicBlock *To = chooseBlock(P);
+    if (To == P.Home)
+      continue;
+    LLVM_DEBUG(dbgs() << "amdgpu-global-sched:   place "
+                      << TII->getName(MI->getOpcode()) << " "
+                      << printMBBReference(*P.Home) << " -> "
+                      << printMBBReference(*To) << "\n");
+    place(*MI, *To);
+    Changed = true;
+  }
+
+  return Changed;
 }
 
 namespace {
@@ -339,7 +416,7 @@ public:
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<MachineDominatorTreeWrapperPass>();
     AU.addRequired<MachineCycleInfoWrapperPass>();
-    AU.setPreservesAll();
+    AU.setPreservesCFG();
     MachineFunctionPass::getAnalysisUsage(AU);
   }
 };
@@ -372,6 +449,7 @@ AMDGPUGlobalSchedPass::run(MachineFunction &MF,
                            MachineFunctionAnalysisManager &MFAM) {
   MachineDominatorTree &DT = MFAM.getResult<MachineDominatorTreeAnalysis>(MF);
   MachineCycleInfo &CI = MFAM.getResult<MachineCycleAnalysis>(MF);
-  AMDGPUGlobalSchedImpl(DT, CI).run(MF);
-  return PreservedAnalyses::all();
+  if (!AMDGPUGlobalSchedImpl(DT, CI).run(MF))
+    return PreservedAnalyses::all();
+  return getMachineFunctionPassPreservedAnalyses().preserveSet<CFGAnalyses>();
 }
