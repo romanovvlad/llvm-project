@@ -1,0 +1,42 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 -run-pass=amdgpu-global-sched \
+# RUN:     -debug-only=amdgpu-global-sched -o /dev/null %s 2>&1 | FileCheck %s
+# REQUIRES: asserts
+
+# The longest dependence chain, and how much room everything else has.
+#
+# No schedule can be shorter than its longest chain of dependent instructions,
+# so that chain is the floor, and every instruction not on it has slack -- a
+# window of start times that costs nothing. Here %1 -> %2 -> %3 is the chain
+# and %4 hangs off %0 alone, so %4 can start anywhere in that window without
+# making the function longer. Those windows are what there is to schedule
+# into; the chain itself has nowhere to go.
+#
+# Cycles are counted along SSA edges only. A cycle in SSA has to pass through
+# a PHI, so dropping the edges into PHIs leaves a DAG, and what is left is the
+# chain through one iteration -- which is the one that is paid per trip.
+
+# CHECK: amdgpu-global-sched: chain: 6 instrs, 4 cycles, 5 on the chain
+
+# CHECK-DAG: amdgpu-global-sched:   %bb.0 COPY start 0 slack 0
+# CHECK-DAG: amdgpu-global-sched:   %bb.0 V_ADD_U32_e32 start 1 slack 0
+# CHECK-DAG: amdgpu-global-sched:   %bb.0 V_MUL_F32_e32 start 2 slack 0
+# CHECK-DAG: amdgpu-global-sched:   %bb.0 V_SUB_U32_e32 start 3 slack 0
+# CHECK-DAG: amdgpu-global-sched:   %bb.0 S_ENDPGM start 4 slack 0
+
+# %4 reads %0 and nothing else, so it may start at 1, 2 or 3.
+# CHECK-DAG: amdgpu-global-sched:   %bb.0 V_XOR_B32_e32 start 1 slack 2
+
+---
+name:            chain_slack
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $vgpr0
+
+    %0:vgpr_32 = COPY $vgpr0
+    %1:vgpr_32 = V_ADD_U32_e32 %0, %0, implicit $exec
+    %2:vgpr_32 = nofpexcept V_MUL_F32_e32 %1, %1, implicit $mode, implicit $exec
+    %3:vgpr_32 = V_SUB_U32_e32 %2, %2, implicit $exec
+    %4:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    S_ENDPGM 0, implicit %3, implicit %4
+...

@@ -50,9 +50,11 @@
 #include "MCTargetDesc/AMDGPUMCTargetDesc.h"
 #include "SIInstrInfo.h"
 #include "SIRegisterInfo.h"
+#include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/CodeGen/MachineCycleAnalysis.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/TargetSchedule.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -92,6 +94,7 @@ private:
   const SIInstrInfo *TII = nullptr;
   const SIRegisterInfo *TRI = nullptr;
   MachineRegisterInfo *MRI = nullptr;
+  TargetSchedModel SchedModel;
 
   /// Blocks holding nothing that writes EXEC or MODE. Crossing one of those
   /// changes what an instruction computes, or which lanes see it, without any
@@ -108,8 +111,53 @@ private:
   /// Which block of \p P to schedule into.
   MachineBasicBlock *chooseBlock(const Placement &P) const;
 
+  /// Earliest and latest start time of each instruction, in cycles, as the
+  /// dependence graph alone allows. Fills \p Start and \p Slack and returns
+  /// the length of the longest chain.
+  unsigned chainOf(MachineFunction &MF,
+                   DenseMap<const MachineInstr *, unsigned> &Start,
+                   DenseMap<const MachineInstr *, unsigned> &Slack) const;
+
   /// Put \p MI into \p To, in a position that reads nothing defined after it.
   void place(MachineInstr &MI, MachineBasicBlock &To) const;
+
+  /// Cycles \p MI occupies. An instruction the scheduling model knows nothing
+  /// about -- WAVE_BARRIER, SCHED_BARRIER, IMPLICIT_DEF -- is given the
+  /// model's default rather than a real number, and the default is large
+  /// enough to swamp every real chain, so it is worth nothing instead. None of
+  /// them assemble to anything.
+  unsigned latencyOf(const MachineInstr &MI) const {
+    if (MI.isMetaInstruction())
+      return 0;
+    return SchedModel.computeInstrLatency(&MI);
+  }
+
+  /// Cycles between \p Def issuing and \p Use being able to read \p MO.
+  unsigned latencyBetween(const MachineInstr &Def, const MachineInstr &Use,
+                          const MachineOperand &MO) const {
+    if (Def.isMetaInstruction() || Use.isMetaInstruction())
+      return 0;
+    unsigned DefIdx = 0;
+    for (const MachineOperand &DefMO : Def.operands())
+      if (DefMO.isReg() && DefMO.isDef() && DefMO.getReg() == MO.getReg()) {
+        DefIdx = Def.getOperandNo(&DefMO);
+        break;
+      }
+    return SchedModel.computeOperandLatency(&Def, DefIdx, &Use,
+                                            Use.getOperandNo(&MO));
+  }
+
+  /// Cycles the chain keeps running after \p MI issues. Only a value anyone
+  /// can wait for is worth anything here: S_BARRIER is modelled at 500 cycles
+  /// (SISchedule.td, "XXX: Guessed ???"), but it defines nothing, so no edge
+  /// leaves it and no instruction is later because of it. Counting it would
+  /// make every chain 500 long and say nothing about the code.
+  unsigned tailOf(const MachineInstr &MI) const {
+    for (const MachineOperand &MO : MI.defs())
+      if (MO.isReg() && MO.getReg().isVirtual())
+        return latencyOf(MI);
+    return 0;
+  }
 
   static unsigned levelOf(const MachineDomTreeNode *N) { return N->getLevel(); }
 
@@ -271,6 +319,69 @@ Placement AMDGPUGlobalSchedImpl::intervalOf(MachineInstr &MI) const {
   return P;
 }
 
+unsigned AMDGPUGlobalSchedImpl::chainOf(
+    MachineFunction &MF, DenseMap<const MachineInstr *, unsigned> &Start,
+    DenseMap<const MachineInstr *, unsigned> &Slack) const {
+  // Reverse post-order over blocks, program order inside one, is a topological
+  // order of the SSA dependence graph: a definition's block dominates every
+  // use's, and dominance implies precedence in reverse post-order. The one
+  // exception is a PHI, whose operands may be defined anywhere -- but every
+  // cycle in SSA runs through a PHI, so dropping the edges into PHIs is both
+  // what makes the graph acyclic and what makes this order work. What is left
+  // is the chain through a single iteration, which is the one paid per trip.
+  SmallVector<MachineInstr *, 0> Order;
+  for (MachineBasicBlock *MBB :
+       ReversePostOrderTraversal<MachineFunction *>(&MF))
+    for (MachineInstr &MI : *MBB)
+      if (!MI.isDebugInstr())
+        Order.push_back(&MI);
+
+  // Forwards: the earliest an instruction can start is when its last operand
+  // is ready.
+  unsigned Length = 0;
+  for (MachineInstr *MI : Order) {
+    unsigned S = 0;
+    if (!MI->isPHI()) {
+      for (const MachineOperand &MO : MI->uses()) {
+        if (!MO.isReg() || !MO.getReg().isVirtual())
+          continue;
+        MachineInstr *Def = MRI->getVRegDef(MO.getReg());
+        auto It = Start.find(Def);
+        if (It == Start.end())
+          continue;
+        S = std::max(S, It->second + latencyBetween(*Def, *MI, MO));
+      }
+    }
+    Start[MI] = S;
+    Length = std::max(Length, S + tailOf(*MI));
+  }
+
+  // Backwards: the latest an instruction can start without pushing the end of
+  // the chain out is when its first consumer needs it. Everything left over
+  // is slack -- a window of start times that costs nothing, and the only room
+  // there is to schedule into.
+  DenseMap<const MachineInstr *, unsigned> Latest;
+  for (MachineInstr *MI : reverse(Order)) {
+    unsigned L = Length - tailOf(*MI);
+    if (auto It = Latest.find(MI); It != Latest.end())
+      L = It->second;
+    Slack[MI] = L - Start[MI];
+    if (MI->isPHI())
+      continue;
+    for (const MachineOperand &MO : MI->uses()) {
+      if (!MO.isReg() || !MO.getReg().isVirtual())
+        continue;
+      MachineInstr *Def = MRI->getVRegDef(MO.getReg());
+      unsigned Want = L - latencyBetween(*Def, *MI, MO);
+      auto [DI, New] = Latest.try_emplace(Def, Want);
+      if (!New)
+        DI->second = std::min(DI->second, Want);
+    }
+  }
+
+  return Length;
+}
+
 MachineBasicBlock *
 AMDGPUGlobalSchedImpl::chooseBlock(const Placement &P) const {
   // Walk the interval from its latest end towards its earliest, and take the
@@ -325,6 +436,7 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
   TII = ST.getInstrInfo();
   TRI = &TII->getRegisterInfo();
   MRI = &MF.getRegInfo();
+  SchedModel.init(&ST);
 
   Clean.clear();
   for (MachineBasicBlock &MBB : MF) {
@@ -376,6 +488,20 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
       dbgs() << " free " << printMBBReference(*P.Lo) << ".."
              << printMBBReference(*P.Hi) << " width " << Width << "\n";
     }
+  });
+
+  DenseMap<const MachineInstr *, unsigned> Start, Slack;
+  unsigned Length = chainOf(MF, Start, Slack);
+
+  LLVM_DEBUG({
+    unsigned OnChain =
+        count_if(Found, [&](auto &P) { return Slack.lookup(P.first) == 0; });
+    dbgs() << "amdgpu-global-sched: chain: " << NumInstrs << " instrs, "
+           << Length << " cycles, " << OnChain << " on the chain\n";
+    for (auto &[MI, P] : Found)
+      dbgs() << "amdgpu-global-sched:   " << printMBBReference(*P.Home) << " "
+             << TII->getName(MI->getOpcode()) << " start " << Start.lookup(MI)
+             << " slack " << Slack.lookup(MI) << " lat " << tailOf(*MI) << "\n";
   });
 
   // Emit back to front. An instruction is placed ahead of its first reader in
