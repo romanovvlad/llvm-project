@@ -147,12 +147,22 @@ private:
                           const MachineOperand &MO) const {
     if (Def.isMetaInstruction() || Use.isMetaInstruction())
       return 0;
-    unsigned DefIdx = 0;
-    for (const MachineOperand &DefMO : Def.operands())
-      if (DefMO.isReg() && DefMO.isDef() && DefMO.getReg() == MO.getReg()) {
+    unsigned DefIdx = 0, DefNo = 0;
+    for (const MachineOperand &DefMO : Def.defs()) {
+      if (DefMO.isReg() && DefMO.getReg() == MO.getReg()) {
         DefIdx = Def.getOperandNo(&DefMO);
         break;
       }
+      ++DefNo;
+    }
+
+    // A pseudo defining more registers than the model has writes for --
+    // S_UADDO_PSEUDO defines a value and a carry, the model names one -- makes
+    // computeOperandLatency abort on an incomplete model. Its own latency is
+    // the answer in that case.
+    if (DefNo >= SchedModel.resolveSchedClass(&Def)->NumWriteLatencyEntries)
+      return latencyOf(Def);
+
     return SchedModel.computeOperandLatency(&Def, DefIdx, &Use,
                                             Use.getOperandNo(&MO));
   }
