@@ -1,0 +1,75 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 -run-pass=amdgpu-global-sched \
+# RUN:     -debug-only=amdgpu-global-sched -o /dev/null %s 2>&1 | FileCheck %s
+#
+# REQUIRES: asserts
+
+# Where an instruction is allowed to live, taking the whole function at once.
+#
+# A schedule is a map from instruction to (block, index). For a pure
+# instruction the only thing equivalence asks is that its block is dominated
+# by every operand's definition and dominates every use. Those blocks are a
+# path in the dominator tree, so the answer is an interval -- the same shape
+# as the slot interval the per-block code already computes -- and this pass
+# reads that interval off. Nothing moves yet.
+#
+# Everything that is not pure is pinned to the block lowering gave it, and the
+# reasons are separate mechanisms, not one rule: a store is not safe to move at
+# all; SCC is one bit whose liveness nothing tracks between blocks; a physical
+# register read has no def to dominate it; V_READFIRSTLANE reads across lanes,
+# so what it computes is a function of EXEC.
+
+# CHECK: amdgpu-global-sched: legal_blocks: 4 blocks, 8 instrs, 3 free, 5 pinned
+
+# Operands come from bb.0, the only reader is in bb.3, and bb.0 dominates bb.3:
+# every block on that chain is legal.
+# CHECK-DAG: amdgpu-global-sched:   %bb.0 V_ADD_U32_e32 free %bb.0..%bb.3 width 4
+
+# The same two operands and the same reader, so the same interval -- the block
+# lowering happened to pick is not one of its ends. Reading $mode does not pin
+# it.
+# CHECK-DAG: amdgpu-global-sched:   %bb.1 V_MUL_F32_e32 free %bb.0..%bb.3 width 4
+
+# Its reader is in its own block, but one of its operands is defined in bb.1,
+# so that is where the interval starts.
+# CHECK-DAG: amdgpu-global-sched:   %bb.3 V_ADD_U32_e32 free %bb.1..%bb.3 width 3
+
+# CHECK-DAG: amdgpu-global-sched:   %bb.0 COPY pinned (physreg)
+# CHECK-DAG: amdgpu-global-sched:   %bb.1 S_ADD_I32 pinned (scc)
+# CHECK-DAG: amdgpu-global-sched:   %bb.2 V_READFIRSTLANE_B32 pinned (convergent)
+# CHECK-DAG: amdgpu-global-sched:   %bb.3 S_ENDPGM pinned (unsafe)
+
+---
+name:            legal_blocks
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    successors: %bb.1
+    liveins: $vgpr0, $vgpr1
+
+    ; Pinned: reads a physical register, which has no definition to dominate it.
+    %0:vgpr_32 = COPY $vgpr0
+    %1:vgpr_32 = COPY $vgpr1
+
+    ; Pure, and its only reader is in bb.3.
+    %2:vgpr_32 = V_ADD_U32_e32 %0, %1, implicit $exec
+
+  bb.1:
+    successors: %bb.2
+
+    ; Pinned: writes SCC.
+    %3:sreg_32 = S_ADD_I32 1, 2, implicit-def $scc
+
+    ; Pure, and its only reader is in bb.3. nofpexcept is what instruction
+    ; selection puts on every FP operation outside a strictfp function.
+    %4:vgpr_32 = nofpexcept V_MUL_F32_e32 %0, %1, implicit $mode, implicit $exec
+
+  bb.2:
+    successors: %bb.3
+
+    ; Pinned: convergent, and the SGPR it defines is a function of EXEC.
+    %5:sreg_32_xm0 = V_READFIRSTLANE_B32 %0, implicit $exec
+
+  bb.3:
+    %6:vgpr_32 = V_ADD_U32_e32 %2, %4, implicit $exec
+    S_ENDPGM 0, implicit %6, implicit %3, implicit %5
+...

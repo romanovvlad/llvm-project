@@ -58,6 +58,7 @@ add_llvm_target(AMDGPUCodeGen
   AMDGPUExportKernelRuntimeHandles.cpp
   AMDGPUFrameLowering.cpp
   AMDGPUGlobalISelDivergenceLowering.cpp
+  AMDGPUGlobalSched.cpp
   AMDGPUGlobalISelUtils.cpp
   AMDGPUHazardLatency.cpp
   AMDGPUHSAMetadataStreamer.cpp
