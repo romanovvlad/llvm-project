@@ -1,0 +1,58 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 -run-pass=amdgpu-global-sched \
+# RUN:     -debug-only=amdgpu-global-sched -o /dev/null %s 2>&1 | FileCheck %s
+# REQUIRES: asserts
+
+# A region is a much smaller problem than the factorial of its size says, and
+# both of the reasons can be found without searching anything.
+#
+# The first is that some instructions no schedule can tell apart: the same
+# opcode, the same earliest and latest cycle, and unordered against each
+# other, so either may stand where the other does. Putting k of them in order
+# makes k! schedules that all cost the same.
+#
+# The second is that a region cuts the way the function did. Its own longest
+# run of instructions that cannot be exchanged is a path, and that path splits
+# the rest of the region into pieces that are ordered separately. The pieces
+# cut again, and again, until what is left has no dependence inside it at all.
+# What survives that is the real unit of the problem.
+#
+# Here one region holds eight instructions -- fifteen bits to order. Four of
+# them are a chain, and cutting by it leaves the other four in a single piece;
+# those four are alike, so there is nothing left to decide at all.
+
+# CHECK: region 2: 8 legal, 8 now, 1 cycles, needs 8 HWVALU, 3 alike, cut into 1 biggest 4 hard 1
+# CHECK: amdgpu-global-sched: search: 22 bits to place, 15 to order, 38 total, largest region 8
+# CHECK: amdgpu-global-sched: reduce: 15 bits to order, 3 alike leave 11, cutting again leaves 0, largest region 8 -> 1
+
+---
+name:            reduce
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $vgpr0
+
+    %0:vgpr_32 = COPY $vgpr0
+    S_BARRIER
+
+    ; Four that nothing distinguishes.
+    %1:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %2:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %3:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %4:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+
+    ; Four in a row, which is what the region gets cut by.
+    %5:vgpr_32 = V_MUL_U32_U24_e32 %0, %0, implicit $exec
+    %6:vgpr_32 = V_MUL_U32_U24_e32 %5, %5, implicit $exec
+    %7:vgpr_32 = V_MUL_U32_U24_e32 %6, %6, implicit $exec
+    %8:vgpr_32 = V_MUL_U32_U24_e32 %7, %7, implicit $exec
+
+    ; Longer than either, so this is the path the regions come from.
+    %9:vgpr_32 = V_ADD_U32_e32 %0, %0, implicit $exec
+    %10:vgpr_32 = V_ADD_U32_e32 %9, %9, implicit $exec
+    %11:vgpr_32 = V_ADD_U32_e32 %10, %10, implicit $exec
+    %12:vgpr_32 = V_ADD_U32_e32 %11, %11, implicit $exec
+    %13:vgpr_32 = V_ADD_U32_e32 %12, %12, implicit $exec
+    %14:vgpr_32 = V_ADD_U32_e32 %13, %13, implicit $exec
+
+    S_ENDPGM 0, implicit %1, implicit %2, implicit %3, implicit %4, implicit %8, implicit %14
+...

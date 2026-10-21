@@ -191,6 +191,25 @@ struct Regions {
   }
 };
 
+/// How much smaller the ordering problem inside one region gets once the
+/// instructions no schedule can tell apart stop being told apart, and once the
+/// region is cut again by a path of its own.
+struct Reduction {
+  unsigned Insts = 0; ///< instructions in the region
+  unsigned Same = 0;  ///< of them, ones an earlier one already stands for
+  unsigned Cut = 0;   ///< pieces left once there is nothing more to cut by
+  unsigned Worst = 0; ///< instructions in the biggest piece
+  unsigned Hard = 0;  ///< of those, ones not standing for each other
+  double Bits = 0;    ///< bits to order it now
+  double BySame = 0;  ///< bits once the alike are not reordered
+  double ByCut = 0;   ///< bits once it is cut as well
+};
+
+/// Bits to put \p N things in an order: log2(N!).
+static double bitsOf(unsigned N) {
+  return std::lgamma(N + 1.0) / std::log(2.0);
+}
+
 /// What a step of a path is worth.
 ///
 /// Cycles weighs an edge by its latency, so the longest path is the critical
@@ -265,6 +284,11 @@ private:
   /// not on \p Path saying where that instruction may go.
   void regionsOf(const DepGraph &G, ArrayRef<MachineInstr *> Path,
                  const Timing &T, Regions &R) const;
+
+  /// Two ways one region's ordering problem is smaller than its size says.
+  /// \p In is everything in that region, in topological order.
+  void reduceOf(const DepGraph &G, ArrayRef<MachineInstr *> In, const Timing &T,
+                Reduction &Out) const;
 
   /// Earliest and latest start time of each instruction, in cycles, as \p G
   /// alone allows. Fills \p Start and \p Slack and returns the length of the
@@ -749,6 +773,156 @@ void AMDGPUGlobalSchedImpl::regionsOf(const DepGraph &G,
   }
 }
 
+void AMDGPUGlobalSchedImpl::reduceOf(const DepGraph &G,
+                                     ArrayRef<MachineInstr *> In,
+                                     const Timing &T, Reduction &Out) const {
+  const unsigned N = In.size();
+  Out = Reduction();
+  Out.Insts = Out.Worst = Out.Hard = N;
+  Out.Bits = Out.BySame = Out.ByCut = bitsOf(N);
+  if (N < 2)
+    return;
+
+  DenseMap<const MachineInstr *, unsigned> Idx;
+  for (auto [I, MI] : enumerate(In))
+    Idx[MI] = I;
+
+  // The dependences that stay inside the region. None are lost: a path between
+  // two instructions of one region never leaves it, since leaving would mean
+  // crossing a step of the path that made the region, and then the two of them
+  // would not be in the same one.
+  SmallVector<SmallVector<unsigned, 4>, 0> Succ(N), Pred(N);
+  for (auto [I, MI] : enumerate(In))
+    for (const Dep &S : G.succs(MI))
+      if (auto It = Idx.find(S.Other); It != Idx.end()) {
+        Succ[I].push_back(It->second);
+        Pred[It->second].push_back(I);
+      }
+
+  // Who has to come after whom, a bit per instruction. \p In is topological,
+  // so one backwards sweep settles all of it.
+  SmallVector<BitVector, 0> Reach(N, BitVector(N));
+  for (unsigned I = N; I-- > 0;)
+    for (unsigned J : Succ[I]) {
+      Reach[I] |= Reach[J];
+      Reach[I].set(J);
+    }
+
+  // Instructions no schedule can tell apart: the same opcode, so the same
+  // pipes and the same latency; the same earliest and latest cycle, so the
+  // same price at every slot; and unordered against each other, so either may
+  // stand where the other does. Putting k of them in order makes k! schedules
+  // of one cost, and all but one of those is work nobody needs done.
+  //
+  // This is an equality of time, not of pressure -- two alike instructions
+  // read different registers, so exchanging them does move live ranges. It
+  // bounds how much of the ordering space the timing objective cannot see.
+  auto Alike = [&](ArrayRef<unsigned> Set, unsigned &Same) {
+    DenseMap<std::tuple<unsigned, unsigned, unsigned>, SmallVector<unsigned, 4>>
+        ByKind;
+    for (unsigned I : Set) {
+      unsigned Asap = T.Start.lookup(In[I]);
+      ByKind[{In[I]->getOpcode(), Asap, Asap + T.Slack.lookup(In[I])}]
+          .push_back(I);
+    }
+
+    double Saved = 0;
+    for (auto &[Kind, Members] : ByKind) {
+      // Peel off one group of mutually unordered ones at a time. Ordering
+      // within a group is free; between groups it is not.
+      SmallVector<unsigned, 8> Left(Members.begin(), Members.end()), Group,
+          Rest;
+      while (!Left.empty()) {
+        Group.clear();
+        Rest.clear();
+        for (unsigned I : Left) {
+          if (none_of(Group, [&](unsigned J) {
+                return Reach[J].test(I) || Reach[I].test(J);
+              }))
+            Group.push_back(I);
+          else
+            Rest.push_back(I);
+        }
+        Saved += bitsOf(Group.size());
+        Same += Group.size() - 1;
+        Left.assign(Rest.begin(), Rest.end());
+      }
+    }
+    return Saved;
+  };
+
+  SmallVector<unsigned, 0> All;
+  append_range(All, llvm::seq(0u, N));
+  Out.BySame = Out.Bits - Alike(All, Out.Same);
+
+  // And the region cuts the same way the function did, and its pieces cut
+  // again, for as long as there is anything to cut with. A piece's own longest
+  // run of instructions that cannot be exchanged is a path, and a path of P
+  // steps splits the rest of the piece into P+1 smaller ones, each ordered on
+  // its own. It stops when a piece has no dependences left inside it at all:
+  // nothing there is ordered against anything, so there is no path to cut by,
+  // and only alike can make it smaller. That leftover is the real unit of the
+  // problem -- the widest set of instructions that are mutually unordered and
+  // all different from each other.
+  Out.Worst = Out.Hard = Out.ByCut = 0;
+  Out.Cut = 0;
+
+  SmallVector<SmallVector<unsigned, 0>, 0> Work;
+  Work.push_back(std::move(All));
+  while (!Work.empty()) {
+    SmallVector<unsigned, 0> Set = Work.pop_back_val();
+    const unsigned M = Set.size();
+
+    // Longest run of mutually ordered instructions inside this piece alone.
+    DenseMap<unsigned, unsigned> Depth;
+    DenseMap<unsigned, unsigned> Prev;
+    DenseSet<unsigned> Here(Set.begin(), Set.end());
+    unsigned Deepest = 0, End = M ? Set[0] : 0;
+    for (unsigned I : Set) {
+      unsigned D = 0, From = I;
+      for (unsigned P : Pred[I])
+        if (Here.count(P) && Depth.lookup(P) + 1 > D) {
+          D = Depth.lookup(P) + 1;
+          From = P;
+        }
+      Depth[I] = D;
+      Prev[I] = From;
+      if (D >= Deepest) {
+        Deepest = D;
+        End = I;
+      }
+    }
+
+    // Nothing in here is ordered, so no cut is possible. This is a leaf.
+    if (M < 2 || Deepest == 0) {
+      unsigned Folded = 0;
+      Out.ByCut += bitsOf(M) - Alike(Set, Folded);
+      Out.Worst = std::max(Out.Worst, M);
+      Out.Hard = std::max(Out.Hard, M - Folded);
+      Out.Cut += M != 0;
+      continue;
+    }
+
+    BitVector OnPath(N);
+    for (unsigned I = End, P = Prev.lookup(I); !OnPath.test(I);
+         I = P, P = Prev.lookup(I))
+      OnPath.set(I);
+
+    SmallVector<SmallVector<unsigned, 0>, 0> Piece(OnPath.count() + 1);
+    unsigned Past = 0;
+    for (unsigned I : Set) {
+      if (OnPath.test(I)) {
+        ++Past;
+        continue;
+      }
+      Piece[Past].push_back(I);
+    }
+    for (auto &P : Piece)
+      if (!P.empty())
+        Work.push_back(std::move(P));
+  }
+}
+
 void AMDGPUGlobalSchedImpl::chainOf(const DepGraph &G, Timing &T) const {
   auto &Start = T.Start;
   auto &Slack = T.Slack;
@@ -1027,9 +1201,15 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
     double Order = 0;
     unsigned Worst = 0;
     for (unsigned B : Busy) {
-      Order += std::lgamma(B + 1.0) / std::log(2.0);
+      Order += bitsOf(B);
       Worst = std::max(Worst, B);
     }
+
+    // What is in each region now, in topological order -- Wins is built by a
+    // sweep over G.Order, so filtering it keeps that order.
+    SmallVector<SmallVector<MachineInstr *, 0>, 0> Hold(R.size());
+    for (const Window &W : R.Wins)
+      Hold[W.Here].push_back(W.MI);
 
     unsigned Num = R.Wins.size();
     dbgs() << "amdgpu-global-sched: regions: " << R.size() << " regions, "
@@ -1040,6 +1220,8 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
     // whatever order the region is put in.
     uint64_t ByPath = 0, ByPipe = 0;
     unsigned Over = 0;
+    double Same = 0, ByCut = 0;
+    unsigned Alike = 0, Hardest = 0;
     for (unsigned I = 0; I < R.size(); ++I) {
       auto [Need, Pipe] = R.floorOf(I);
       ByPath += R.cap(I);
@@ -1049,6 +1231,17 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
              << " legal, " << Busy[I] << " now, " << R.cap(I) << " cycles";
       if (Need)
         dbgs() << ", needs " << Need << " " << SchedModel.getResourceName(Pipe);
+
+      // The same region, asked how much of its order is a real choice.
+      Reduction Red;
+      reduceOf(G, Hold[I], T, Red);
+      Same += Red.BySame;
+      ByCut += Red.ByCut;
+      Alike += Red.Same;
+      Hardest = std::max(Hardest, Red.Hard);
+      if (Red.Same || Red.Cut > 1)
+        dbgs() << ", " << Red.Same << " alike, cut into " << Red.Cut
+               << " biggest " << Red.Worst << " hard " << Red.Hard;
       dbgs() << "\n";
     }
     {
@@ -1089,6 +1282,16 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
            << " to order, " << (uint64_t)std::llround(Place + Order)
            << " total, largest region " << Worst << ", "
            << (uint64_t)std::llround(Narrow) << " bits without a stall\n";
+
+    // The ordering bits that are a real choice. Alike instructions make a
+    // region's factorial bigger without making its schedule any different, and
+    // a region that cuts into pieces is a sum of small factorials instead of
+    // one big one. Neither needs a search to find.
+    dbgs() << "amdgpu-global-sched: reduce: " << (uint64_t)std::llround(Order)
+           << " bits to order, " << Alike << " alike leave "
+           << (uint64_t)std::llround(Same) << ", cutting again leaves "
+           << (uint64_t)std::llround(ByCut) << ", largest region " << Worst
+           << " -> " << Hardest << "\n";
 
     // And what each choice costs. A slot of a region issues at a known cycle,
     // so putting an instruction there has a price that can be read off before
