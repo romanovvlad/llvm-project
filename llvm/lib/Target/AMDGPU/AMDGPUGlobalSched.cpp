@@ -51,6 +51,7 @@
 #include "SIInstrInfo.h"
 #include "SIRegisterInfo.h"
 #include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/CodeGen/MachineCycleAnalysis.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
@@ -659,6 +660,50 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
            << " instrs, " << CycleWeight << " cycles\n";
     dbgs() << "amdgpu-global-sched: path by steps: " << BySteps.size()
            << " instrs, " << StepWeight << " steps\n";
+    // Is the graph many separate computations, or one wide one? Two
+    // instructions can be unordered either because nothing connects them at
+    // all, or because they share an ancestor and neither reaches the other.
+    // Weakly connected components tell the two apart, and the count of
+    // instructions at each step-depth says how wide the thing is.
+    DenseMap<const MachineInstr *, const MachineInstr *> Parent;
+    std::function<const MachineInstr *(const MachineInstr *)> Find =
+        [&](const MachineInstr *MI) {
+          while (Parent[MI] != MI)
+            MI = Parent[MI] = Parent[Parent[MI]];
+          return MI;
+        };
+
+    SmallVector<unsigned, 0> Level;
+    DenseMap<const MachineInstr *, unsigned> Depth;
+    for (MachineInstr *MI : orderOf(MF)) {
+      Parent.try_emplace(MI, MI);
+      unsigned D = 0;
+      if (!MI->isPHI())
+        for (const MachineOperand &MO : MI->uses()) {
+          if (!MO.isReg() || !MO.getReg().isVirtual())
+            continue;
+          MachineInstr *Def = MRI->getVRegDef(MO.getReg());
+          Parent.try_emplace(Def, Def);
+          Parent[Find(Def)] = Find(MI);
+          D = std::max(D, Depth.lookup(Def) + 1);
+        }
+      Depth[MI] = D;
+      if (D >= Level.size())
+        Level.resize(D + 1);
+      ++Level[D];
+    }
+
+    DenseMap<const MachineInstr *, unsigned> Size;
+    for (auto &[MI, P] : Parent)
+      ++Size[Find(MI)];
+    unsigned Biggest = 0;
+    for (auto &[Root, N] : Size)
+      Biggest = std::max(Biggest, N);
+    dbgs() << "amdgpu-global-sched: shape: " << Size.size()
+           << " components, biggest " << Biggest << ", " << Level.size()
+           << " levels, widest " << *max_element(Level) << ", "
+           << NumInstrs / Level.size() << " per level\n";
+
     // Where everything else stands with respect to that path. An instruction
     // that reaches a step of the path has to come before that step; one the
     // path reaches has to come after; the rest are ordered against it by

@@ -1,0 +1,39 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 -run-pass=amdgpu-global-sched \
+# RUN:     -debug-only=amdgpu-global-sched -o /dev/null %s 2>&1 | FileCheck %s
+# REQUIRES: asserts
+
+# Why so much of a function is unordered against its longest path.
+#
+# Two instructions can fail to be ordered for two quite different reasons:
+# nothing connects them at all, or they share an ancestor and neither reaches
+# the other. Only the first is "independent computations"; the second is one
+# computation that is simply wide. Weakly connected components tell them
+# apart.
+#
+# Here everything descends from %0, so there is one component. But the graph
+# is three levels deep and four wide: %1..%4 are siblings, pairwise
+# unordered, and a longest path goes through exactly one of them. The other
+# three are then unordered against that path -- not because they are separate
+# work, but because they are the same work done four times side by side.
+#
+# That is the shape of a GPU kernel, and it is why cutting on the chain does
+# not narrow anything.
+
+# CHECK: amdgpu-global-sched: shape: 1 components, biggest 6, 3 levels, widest 4, 2 per level
+
+---
+name:            wide_shape
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $vgpr0
+
+    %0:vgpr_32 = COPY $vgpr0
+
+    %1:vgpr_32 = V_ADD_U32_e32 %0, %0, implicit $exec
+    %2:vgpr_32 = V_SUB_U32_e32 %0, %0, implicit $exec
+    %3:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %4:vgpr_32 = V_OR_B32_e32 %0, %0, implicit $exec
+
+    S_ENDPGM 0, implicit %1, implicit %2, implicit %3, implicit %4
+...
