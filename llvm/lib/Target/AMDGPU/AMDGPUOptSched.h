@@ -308,7 +308,12 @@ public:
   /// actually gets applied is still decided by measuring the chosen order with
   /// the backend's own trackers -- a model that disagrees with the allocator
   /// must never be the last word.
-  Pressure pressureOf(ArrayRef<unsigned> Order) const;
+  /// \p Trace, if given, receives the pressure at each position of \p Order,
+  /// sampled where the peak is: definitions counted, nothing dead yet. It is
+  /// how the model gets lined up against the trackers instruction by
+  /// instruction instead of only at its peak.
+  Pressure pressureOf(ArrayRef<unsigned> Order,
+                      SmallVectorImpl<Pressure> *Trace = nullptr) const;
 
   Cost costOf(ArrayRef<unsigned> Order) const;
 

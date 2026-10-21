@@ -867,8 +867,12 @@ struct UnitFiles {
 /// blind to exactly the case this is here for: a schedule that moves a short
 /// virtual live range into the one window where every physical register is
 /// already taken raises neither peak on its own, and is still fatal.
+/// \p Trace, if given, receives the demand at each position of \p Order, so
+/// the measurement can be lined up against Problem::pressureOf position by
+/// position. The walk is upward, so it is filled back to front.
 Demand demandOf(ScheduleDAGMILive &DAG, ArrayRef<unsigned> Order,
-                const UnitFiles &Files, bool Unified) {
+                const UnitFiles &Files, bool Unified,
+                SmallVectorImpl<Demand> *Trace = nullptr) {
   MachineBasicBlock *MBB = DAG.SUnits[0].getInstr()->getParent();
   auto BBEnd = MBB->end();
   const SIRegisterInfo &TRI = *static_cast<const SIRegisterInfo *>(DAG.TRI);
@@ -903,6 +907,7 @@ Demand demandOf(ScheduleDAGMILive &DAG, ArrayRef<unsigned> Order,
   };
 
   Demand Max;
+  Demand Last; ///< The most recent sample, for \p Trace.
   /// \p Dead is the demand of \p MI's own dead defs, which a live-range view
   /// misses entirely: a value nobody reads is live nowhere, but the register
   /// holding it still has to exist for the one cycle the instruction writes
@@ -943,15 +948,20 @@ Demand demandOf(ScheduleDAGMILive &DAG, ArrayRef<unsigned> Order,
         }
       }
     D.VGPR = Unified ? D.ArchVGPR + D.AGPR : D.ArchVGPR;
+    Last = D;
     Max.takeMax(D);
   };
 
   Sample(nullptr);
+  if (Trace)
+    Trace->assign(Order.size(), Demand());
   for (unsigned I = Order.size(); I-- > 0;) {
     const MachineInstr &MI = *DAG.SUnits[Order[I]].getInstr();
     RPT.recede(MI);
     Phys.stepBackward(MI);
     Sample(&MI);
+    if (Trace)
+      (*Trace)[I] = Last;
   }
   return Max;
 }
@@ -1136,16 +1146,33 @@ void OptSchedStrategy::initialize(ScheduleDAGMI *DAGMI) {
       };
       LLVM_DEBUG(dbgs() << "optsched: demand " << Show(Before) << " -> "
                         << Show(After) << "\n");
-      // What the model thought, in the same units. The gate above is the
-      // truth; printing the two side by side is how a gap between them gets
-      // found rather than guessed at.
+      // What the model thought, in the same units, and where it first parts
+      // company with the trackers. The gate above is the truth; the model only
+      // steers, but a model that is wrong by eighty registers steers into a
+      // spill, and finding where it goes wrong beats guessing at it.
       DEBUG_WITH_TYPE("amdgpu-optsched-regs", {
         auto ShowP = [](const Pressure &Pr) {
           return formatv("{0}+{1} VGPR / {2} SGPR", Pr[RegFile::ArchVGPR],
                          Pr[RegFile::AGPR], Pr[RegFile::SGPR]);
         };
-        dbgs() << "optsched: model " << ShowP(P.pressureOf(Order)) << " -> "
-               << ShowP(P.pressureOf(Cand.Order)) << "\n";
+        SmallVector<Pressure, 0> Model;
+        SmallVector<Demand, 0> Meas;
+        dbgs() << "optsched: model " << ShowP(P.pressureOf(Order, &Model))
+               << " -> " << ShowP(P.pressureOf(Cand.Order)) << "\n";
+        demandOf(DAG, Order, Files, Unified, &Meas);
+        unsigned Worst = 0, WorstAt = ~0u;
+        for (unsigned I = 0, E = Model.size(); I != E; ++I) {
+          unsigned M = Model[I][RegFile::ArchVGPR] + Model[I][RegFile::AGPR];
+          unsigned T = Meas[I].ArchVGPR + Meas[I].AGPR;
+          if (T > M && T - M > Worst) {
+            Worst = T - M;
+            WorstAt = I;
+          }
+        }
+        if (WorstAt != ~0u)
+          dbgs() << "optsched: model low by " << Worst << " VGPR at position "
+                 << WorstAt << " of " << Model.size() << ": "
+                 << *DAG.SUnits[Order[WorstAt]].getInstr();
       });
       if (!After.noWorseThan(Before)) {
         ++NumPressureRejects;

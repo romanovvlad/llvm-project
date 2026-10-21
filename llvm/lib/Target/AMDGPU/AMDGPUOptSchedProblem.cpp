@@ -380,9 +380,15 @@ void Problem::buildRegisterModel(const ScheduleDAGMILive &DAG) {
   // Node numbers are source order, which is a topological order, so the first
   // definition seen is the one that opens the range.
   SmallVector<bool, 0> HasDef;
+  /// Read before anything in this region defined it, so it came in alive.
+  /// Distinct from "never defined here": a tied operand both reads a value and
+  /// writes it, and the read is the older half.
+  SmallVector<bool, 0> ReadFirst;
   auto Record = [&](unsigned I, unsigned V, bool IsDef) {
-    if (HasDef.size() <= V)
+    if (HasDef.size() <= V) {
       HasDef.resize(V + 1, false);
+      ReadFirst.resize(V + 1, false);
+    }
     if (IsDef) {
       if (!HasDef[V]) {
         HasDef[V] = true;
@@ -390,6 +396,8 @@ void Problem::buildRegisterModel(const ScheduleDAGMILive &DAG) {
       }
       return;
     }
+    if (!HasDef[V])
+      ReadFirst[V] = true;
     // Dedupe within the instruction: two operands naming one value is one
     // read as far as liveness is concerned.
     if (!llvm::is_contained(Uses[I], V)) {
@@ -483,9 +491,15 @@ void Problem::buildRegisterModel(const ScheduleDAGMILive &DAG) {
 
   for (unsigned V = 0, E = Values.size(); V != E; ++V) {
     bool Defined = V < HasDef.size() && HasDef[V];
+    bool Read = V < ReadFirst.size() && ReadFirst[V];
     if (!Values[V].Phys) {
-      // A virtual register with no definition here came in alive from above.
-      Values[V].LiveIn = !Defined;
+      // A virtual register came in alive if nothing here defined it, or if
+      // something here read it before anything here defined it. The second
+      // case is a tied operand -- V_PERMLANE32_SWAP_B32 reads two registers
+      // and writes them back -- and treating it as a fresh definition threw
+      // away the whole range above the instruction. Silently: unlike the
+      // physical side below there is no running count to wrap.
+      Values[V].LiveIn = !Defined || Read;
     } else if (!Defined) {
       // A physical unit already knows whether it was live in, from the block.
       // But if it is read here without being written here then it was, and the
@@ -515,7 +529,8 @@ unsigned Budget::excessOf(const Pressure &P) const {
   return Over;
 }
 
-Pressure Problem::pressureOf(ArrayRef<unsigned> Order) const {
+Pressure Problem::pressureOf(ArrayRef<unsigned> Order,
+                             SmallVectorImpl<Pressure> *Trace) const {
   // Whatever crosses the region is held for all of it, so it is where the
   // count starts rather than something added at the end.
   Pressure Cur = LiveThru;
@@ -536,6 +551,8 @@ Pressure Problem::pressureOf(ArrayRef<unsigned> Order) const {
     // def is live nowhere, but the register it writes still has to exist for
     // the cycle that writes it.
     Peak.takeMax(Cur);
+    if (Trace)
+      Trace->push_back(Cur);
 
     for (unsigned V : Defs[Node])
       if (!Values[V].LiveIn && !Values[V].LiveOut && Values[V].Uses == 0)
