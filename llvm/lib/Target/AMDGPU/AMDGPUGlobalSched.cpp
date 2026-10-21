@@ -60,6 +60,7 @@
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cmath>
 
 using namespace llvm;
 
@@ -185,10 +186,12 @@ private:
   /// A path of N instructions cuts the function into N+1 regions: one before
   /// each step and one after the last. \p Count is filled with how many of
   /// the instructions not on \p Path dependence allows into each region, and
-  /// \p Width with how many regions each such instruction is allowed into.
+  /// \p Width with how many regions each such instruction is allowed into,
+  /// and \p Here with the region each one is in now.
   void regionsOf(const DepGraph &G, ArrayRef<MachineInstr *> Path,
                  SmallVectorImpl<unsigned> &Count,
-                 SmallVectorImpl<unsigned> &Width) const;
+                 SmallVectorImpl<unsigned> &Width,
+                 SmallVectorImpl<unsigned> &Here) const;
 
   /// Earliest and latest start time of each instruction, in cycles, as \p G
   /// alone allows. Fills \p Start and \p Slack and returns the length of the
@@ -591,7 +594,8 @@ AMDGPUGlobalSchedImpl::chainPath(const DepGraph &G, Weigh How,
 void AMDGPUGlobalSchedImpl::regionsOf(const DepGraph &G,
                                       ArrayRef<MachineInstr *> Path,
                                       SmallVectorImpl<unsigned> &Count,
-                                      SmallVectorImpl<unsigned> &Width) const {
+                                      SmallVectorImpl<unsigned> &Width,
+                                      SmallVectorImpl<unsigned> &Here) const {
   // Number the steps of the path, and the N+1 regions between them, so that
   // region I is the gap immediately before step I and region N is what comes
   // after the last step.
@@ -602,6 +606,7 @@ void AMDGPUGlobalSchedImpl::regionsOf(const DepGraph &G,
 
   Count.assign(N + 1, 0);
   Width.clear();
+  Here.clear();
 
   // The last step that has to come before an instruction. If a predecessor is
   // a step, that step does; otherwise whatever had to precede it does.
@@ -629,11 +634,17 @@ void AMDGPUGlobalSchedImpl::regionsOf(const DepGraph &G,
   // An instruction may sit anywhere after the last step it needs and before
   // the first step that needs it. That window is a run of whole regions, and
   // it is never empty, since the path is a path.
+  // G.Order is the schedule the function has now, so counting the steps
+  // already gone past says which region an instruction is in today.
+  unsigned Past = 0;
   for (MachineInstr *MI : G.Order) {
-    if (Step.count(MI))
+    if (Step.count(MI)) {
+      ++Past;
       continue;
+    }
     int First = Lo.lookup(MI) + 1, Last = Hi.lookup(MI);
     Width.push_back(Last - First + 1);
+    Here.push_back(Past);
     for (int I = First; I <= Last; ++I)
       ++Count[I];
   }
@@ -882,17 +893,37 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
     // arithmetic cuts nothing -- nothing else in the function is ordered
     // against it. A sequence point is ordered against everything in its
     // block, so each one on the path is a real wall.
-    SmallVector<unsigned, 0> Count, Width;
-    regionsOf(G, ByControl, Count, Width);
+    SmallVector<unsigned, 0> Count, Width, Here;
+    regionsOf(G, ByControl, Count, Width, Here);
     unsigned Slots = 0;
     for (unsigned W : Width)
       Slots += W;
     dbgs() << "amdgpu-global-sched: regions: " << Count.size() << " regions, "
            << Width.size() << " to place, " << Slots << " legal slots, "
            << (Width.empty() ? 0 : Slots / Width.size()) << " regions each\n";
+    // How big the problem is. Choosing a region for each instruction costs
+    // the log of the product of the window widths; ordering what lands in a
+    // region costs the log of the factorial of what is in it. In bits, so
+    // they add, and so the number stays readable at any size.
+    double Place = 0;
+    for (unsigned W : Width)
+      Place += std::log2(W);
+    SmallVector<unsigned, 0> Busy(Count.size(), 0);
+    for (unsigned R : Here)
+      ++Busy[R];
+    double Order = 0;
+    unsigned Worst = 0;
+    for (unsigned B : Busy) {
+      Order += std::lgamma(B + 1.0) / std::log(2.0);
+      Worst = std::max(Worst, B);
+    }
     for (auto [I, C] : enumerate(Count))
-      dbgs() << "amdgpu-global-sched:   region " << I << ": " << C
-             << " legal\n";
+      dbgs() << "amdgpu-global-sched:   region " << I << ": " << C << " legal, "
+             << Busy[I] << " now\n";
+    dbgs() << "amdgpu-global-sched: search: " << (uint64_t)std::llround(Place)
+           << " bits to place, " << (uint64_t)std::llround(Order)
+           << " to order, " << (uint64_t)std::llround(Place + Order)
+           << " total, largest region " << Worst << "\n";
 
     for (MachineInstr *MI : ByCycles)
       dbgs() << "amdgpu-global-sched:   on path "
