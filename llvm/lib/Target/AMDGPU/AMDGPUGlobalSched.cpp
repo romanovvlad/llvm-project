@@ -118,6 +118,21 @@ private:
   }
 };
 
+/// What a step of a path is worth.
+///
+/// Cycles weighs an edge by its latency, so the longest path is the critical
+/// path: the floor under any schedule. Steps weighs every edge one, so it is
+/// the longest run of instructions that cannot be exchanged. Control weighs a
+/// step onto a sequence point far above everything else, so the longest path
+/// is the one crossing the most of them, ties going to the longer run -- the
+/// path that cuts the function into the most pieces rather than the path that
+/// is simply longest.
+enum class Weigh { Cycles, Steps, Control };
+
+/// More than any path can be long, so a path with more control on it beats a
+/// longer one whatever else is counted.
+static constexpr unsigned ControlWeight = 1u << 20;
+
 /// How many memory instructions back to ask about aliasing before giving up
 /// and ordering everything against one point. The comparison is pairwise, so
 /// without a bound one block of loads and stores is quadratic.
@@ -163,11 +178,8 @@ private:
   /// Everything that orders one instruction before another, in one graph.
   void buildDeps(MachineFunction &MF, DepGraph &G) const;
 
-  /// One longest path through \p G, and its weight in \p Weight. \p ByCycles
-  /// weighs an edge by its latency, giving the critical path; otherwise each
-  /// edge weighs one, giving the longest run of instructions that cannot be
-  /// exchanged with each other.
-  SmallVector<MachineInstr *, 0> chainPath(const DepGraph &G, bool ByCycles,
+  /// One longest path through \p G under \p How, and its weight in \p Weight.
+  SmallVector<MachineInstr *, 0> chainPath(const DepGraph &G, Weigh How,
                                            unsigned &Weight) const;
 
   /// A path of N instructions cuts the function into N+1 regions: one before
@@ -530,29 +542,29 @@ void AMDGPUGlobalSchedImpl::buildDeps(MachineFunction &MF, DepGraph &G) const {
 }
 
 SmallVector<MachineInstr *, 0>
-AMDGPUGlobalSchedImpl::chainPath(const DepGraph &G, bool ByCycles,
+AMDGPUGlobalSchedImpl::chainPath(const DepGraph &G, Weigh How,
                                  unsigned &Weight) const {
-  // A longest path, recovered by remembering which operand was the one that
-  // made each instruction wait. Every step of the result reads a value the
-  // step before it defines, so no two instructions on it may be exchanged --
-  // which is what distinguishes a path from the set of instructions with no
-  // slack. That set is the union of all the critical paths, and is routinely
-  // larger than any one of them.
-  //
-  // With \p ByCycles an edge weighs what it costs, and the answer is the
-  // critical path: the floor under any schedule. Otherwise every edge weighs
-  // one and the answer is the most instructions that are pairwise ordered --
-  // the longest run that has to stay in the order it is in, whatever it costs.
+  // A longest path, recovered by remembering which predecessor was the one
+  // that made each instruction wait. Every step of the result is ordered
+  // against the step before it, so no two instructions on it may be exchanged
+  // -- which is what distinguishes a path from the set of instructions with
+  // no slack. That set is the union of all the longest paths, and is
+  // routinely larger than any one of them.
   DenseMap<const MachineInstr *, unsigned> Depth;
   DenseMap<const MachineInstr *, MachineInstr *> Prev;
 
   MachineInstr *End = nullptr;
   Weight = 0;
   for (MachineInstr *MI : G.Order) {
+    unsigned Step = 1;
+    if (How == Weigh::Control && isFence(*MI))
+      Step = ControlWeight + 1;
+
     unsigned D = 0;
     MachineInstr *From = nullptr;
     for (const Dep &P : G.preds(MI)) {
-      unsigned E = Depth.lookup(P.Other) + (ByCycles ? P.Latency : 1);
+      unsigned E =
+          Depth.lookup(P.Other) + (How == Weigh::Cycles ? P.Latency : Step);
       if (E >= D) {
         D = E;
         From = P.Other;
@@ -562,7 +574,7 @@ AMDGPUGlobalSchedImpl::chainPath(const DepGraph &G, bool ByCycles,
     Prev[MI] = From;
     // An instruction nobody waits for still ends a path, but only its own
     // tail counts past the last edge -- see tailOf.
-    unsigned Full = D + (ByCycles ? tailOf(*MI) : 0);
+    unsigned Full = D + (How == Weigh::Cycles ? tailOf(*MI) : 0);
     if (Full >= Weight) {
       Weight = Full;
       End = MI;
@@ -782,14 +794,20 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
     dbgs() << "amdgpu-global-sched: chain: " << NumInstrs << " instrs, "
            << Length << " cycles, " << OnChain << " critical\n";
 
-    // Two different longest paths, and they are rarely the same one.
-    unsigned CycleWeight = 0, StepWeight = 0;
-    auto ByCycles = chainPath(G, /*ByCycles=*/true, CycleWeight);
-    auto BySteps = chainPath(G, /*ByCycles=*/false, StepWeight);
+    // Three different longest paths, and they are rarely the same one.
+    unsigned CycleWeight = 0, StepWeight = 0, CtrlWeight = 0;
+    auto ByCycles = chainPath(G, Weigh::Cycles, CycleWeight);
+    auto BySteps = chainPath(G, Weigh::Steps, StepWeight);
+    auto ByControl = chainPath(G, Weigh::Control, CtrlWeight);
+    unsigned NumControl =
+        count_if(ByControl, [&](MachineInstr *MI) { return isFence(*MI); });
     dbgs() << "amdgpu-global-sched: path by cycles: " << ByCycles.size()
            << " instrs, " << CycleWeight << " cycles\n";
     dbgs() << "amdgpu-global-sched: path by steps: " << BySteps.size()
            << " instrs, " << StepWeight << " steps\n";
+    dbgs() << "amdgpu-global-sched: path by control: " << ByControl.size()
+           << " instrs, " << NumControl << " control, " << ByControl.size() - 1
+           << " steps\n";
     // Is the graph many separate computations, or one wide one? Two
     // instructions can be unordered either because nothing connects them at
     // all, or because they share an ancestor and neither reaches the other.
@@ -859,10 +877,13 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
            << NumInstrs - OnPath.size() - Before.size() - After.size() + Both
            << " unordered\n";
 
-    // The step path is the one worth anchoring to: it has the most steps, so
-    // it cuts the function into the most regions.
+    // The control path is the one worth anchoring to. Regions are only a
+    // useful cut if instructions are legal in few of them, and a step of pure
+    // arithmetic cuts nothing -- nothing else in the function is ordered
+    // against it. A sequence point is ordered against everything in its
+    // block, so each one on the path is a real wall.
     SmallVector<unsigned, 0> Count, Width;
-    regionsOf(G, BySteps, Count, Width);
+    regionsOf(G, ByControl, Count, Width);
     unsigned Slots = 0;
     for (unsigned W : Width)
       Slots += W;
@@ -880,6 +901,10 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
              << "\n";
     for (MachineInstr *MI : BySteps)
       dbgs() << "amdgpu-global-sched:   on steps "
+             << printMBBReference(*MI->getParent()) << " "
+             << TII->getName(MI->getOpcode()) << "\n";
+    for (MachineInstr *MI : ByControl)
+      dbgs() << "amdgpu-global-sched:   on control "
              << printMBBReference(*MI->getParent()) << " "
              << TII->getName(MI->getOpcode()) << "\n";
     for (auto &[MI, P] : Found)

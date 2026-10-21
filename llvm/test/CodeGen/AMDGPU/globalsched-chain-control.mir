@@ -1,0 +1,48 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 -run-pass=amdgpu-global-sched \
+# RUN:     -debug-only=amdgpu-global-sched -o /dev/null %s 2>&1 | FileCheck %s
+# REQUIRES: asserts
+
+# The longest chain is not the one that cuts the function up.
+#
+# A path is only a useful anchor if the instructions not on it are legal in
+# few of the gaps between its steps, and a run of arithmetic gives no such
+# gaps: nothing else in the function is ordered against any particular step
+# of it. A barrier is. Nothing may cross one, so each is a cut nothing is
+# legal on both sides of.
+#
+# Here the longest run is the six adds in bb.0, and it passes through no
+# control at all. The path with the most control in it is the other one:
+# into bb.1, through both barriers. It is less than half as long and worth
+# more.
+
+# CHECK: amdgpu-global-sched: path by steps: 8 instrs, 7 steps
+# CHECK: amdgpu-global-sched: path by control: 4 instrs, 3 control, 3 steps
+
+# CHECK: on control %bb.1 S_BARRIER
+# CHECK-NEXT: on control %bb.1 V_ADD_U32_e32
+# CHECK-NEXT: on control %bb.1 S_BARRIER
+# CHECK-NEXT: on control %bb.1 S_ENDPGM
+
+---
+name:            chain_control
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    successors: %bb.1
+    liveins: $vgpr0
+
+    %0:vgpr_32 = COPY $vgpr0
+    %1:vgpr_32 = V_ADD_U32_e32 %0, %0, implicit $exec
+    %2:vgpr_32 = V_ADD_U32_e32 %1, %1, implicit $exec
+    %3:vgpr_32 = V_ADD_U32_e32 %2, %2, implicit $exec
+    %4:vgpr_32 = V_ADD_U32_e32 %3, %3, implicit $exec
+    %5:vgpr_32 = V_ADD_U32_e32 %4, %4, implicit $exec
+    %6:vgpr_32 = V_ADD_U32_e32 %5, %5, implicit $exec
+    S_BRANCH %bb.1
+
+  bb.1:
+    S_BARRIER
+    %7:vgpr_32 = V_ADD_U32_e32 %0, %0, implicit $exec
+    S_BARRIER
+    S_ENDPGM 0, implicit %6, implicit %7
+...
