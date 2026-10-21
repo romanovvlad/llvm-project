@@ -1,0 +1,39 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 -run-pass=amdgpu-global-sched \
+# RUN:     -debug-only=amdgpu-global-sched -o /dev/null %s 2>&1 | FileCheck %s
+# REQUIRES: asserts
+
+# A region is as long as the stretch of path it stands between, and that
+# length is a promise the pipes may not be able to keep.
+#
+# These four MFMAs depend on nothing but the copies, so dependence lets them
+# all issue within a few cycles of each other. The matrix pipe says
+# otherwise: there is one of it and each of these holds it for eight cycles.
+# Three of the four land in region 1, which dependence makes five cycles
+# long, so that region cannot in fact be shorter than twenty-four, whatever
+# order its contents are put in.
+#
+# Summed over the regions that is a floor under the function -- 35 cycles
+# where dependence alone claims 15 -- and it is found before any search
+# begins.
+
+# CHECK: region 1: 5 legal, 3 now, 5 cycles, needs 24 HWXDL
+# CHECK: amdgpu-global-sched: resources: 15 cycles by dependence, 35 by pipe, 2 of 4 regions short
+
+---
+name:            resources
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $vgpr0_vgpr1_vgpr2_vgpr3, $vgpr4_vgpr5_vgpr6_vgpr7, $agpr0_agpr1_agpr2_agpr3_agpr4_agpr5_agpr6_agpr7_agpr8_agpr9_agpr10_agpr11_agpr12_agpr13_agpr14_agpr15
+
+    %0:vreg_128_align2 = COPY $vgpr0_vgpr1_vgpr2_vgpr3
+    %1:vreg_128_align2 = COPY $vgpr4_vgpr5_vgpr6_vgpr7
+    %2:areg_512_align2 = COPY $agpr0_agpr1_agpr2_agpr3_agpr4_agpr5_agpr6_agpr7_agpr8_agpr9_agpr10_agpr11_agpr12_agpr13_agpr14_agpr15
+
+    %3:areg_512_align2 = V_MFMA_F32_32X32X16_BF16_e64 %0, %1, %2, 0, 0, 0, implicit $mode, implicit $exec
+    %4:areg_512_align2 = V_MFMA_F32_32X32X16_BF16_e64 %0, %1, %2, 0, 0, 0, implicit $mode, implicit $exec
+    %5:areg_512_align2 = V_MFMA_F32_32X32X16_BF16_e64 %0, %1, %2, 0, 0, 0, implicit $mode, implicit $exec
+    %6:areg_512_align2 = V_MFMA_F32_32X32X16_BF16_e64 %0, %1, %2, 0, 0, 0, implicit $mode, implicit $exec
+
+    S_ENDPGM 0, implicit %3, implicit %4, implicit %5, implicit %6
+...

@@ -143,6 +143,10 @@ struct Regions {
   SmallVector<unsigned, 0> Begin, End; ///< the cycles each region spans
   SmallVector<Window, 0> Wins;         ///< one per instruction not on the path
 
+  /// Cycles each pipe is held for by what is in each region now, indexed by
+  /// region and then by the scheduling model's resource number.
+  SmallVector<SmallVector<unsigned, 0>, 0> Load;
+
   unsigned size() const { return Count.size(); }
 
   /// How many instructions region \p R has room for. The machine issues one
@@ -163,6 +167,19 @@ struct Regions {
     int64_t Lo = std::max<int64_t>((int64_t)W.Asap - Begin[R], 0);
     int64_t Hi = std::min<int64_t>((int64_t)W.Alap - Begin[R], cap(R) - 1);
     return {Lo, Hi};
+  }
+
+  /// The shortest region \p R could be whatever order its contents are put
+  /// in: the busiest pipe has to be held for as long as it has to be held.
+  /// Returns that length and which pipe asked for it.
+  std::pair<unsigned, unsigned> floorOf(unsigned R) const {
+    unsigned Need = 0, Pipe = 0;
+    for (auto [I, Held] : enumerate(Load[R]))
+      if (Held > Need) {
+        Need = Held;
+        Pipe = I;
+      }
+    return {Need, Pipe};
   }
 
   /// The cheapest slot of region \p R for \p W, and what it costs.
@@ -225,6 +242,10 @@ private:
 
   /// Every instruction of \p MF in a topological order of its dependences.
   SmallVector<MachineInstr *, 0> orderOf(MachineFunction &MF) const;
+
+  /// Add the cycles \p MI holds each pipe for to \p Load, which is indexed by
+  /// the scheduling model's resource number.
+  void pipesOf(const MachineInstr &MI, SmallVectorImpl<unsigned> &Load) const;
 
   /// Whether \p MI is a sequence point: nothing may be moved across it in
   /// either direction, whatever the values say.
@@ -640,6 +661,24 @@ AMDGPUGlobalSchedImpl::chainPath(const DepGraph &G, Weigh How,
   return Path;
 }
 
+void AMDGPUGlobalSchedImpl::pipesOf(const MachineInstr &MI,
+                                    SmallVectorImpl<unsigned> &Load) const {
+  // One instruction holds a pipe for as long as the model says, and nothing
+  // else may use that pipe meanwhile. There is no ordering in this -- only a
+  // total, which is why it bounds a region however the region is ordered.
+  const MCSchedClassDesc *SC = SchedModel.resolveSchedClass(&MI);
+  if (!SC || !SC->isValid())
+    return;
+  for (const MCWriteProcResEntry &P :
+       make_range(SchedModel.getWriteProcResBegin(SC),
+                  SchedModel.getWriteProcResEnd(SC))) {
+    unsigned Units = SchedModel.getProcResource(P.ProcResourceIdx)->NumUnits;
+    if (!Units)
+      continue;
+    Load[P.ProcResourceIdx] += (P.ReleaseAtCycle - P.AcquireAtCycle) / Units;
+  }
+}
+
 void AMDGPUGlobalSchedImpl::regionsOf(const DepGraph &G,
                                       ArrayRef<MachineInstr *> Path,
                                       const Timing &T, Regions &R) const {
@@ -653,6 +692,8 @@ void AMDGPUGlobalSchedImpl::regionsOf(const DepGraph &G,
 
   R.Count.assign(N + 1, 0);
   R.Wins.clear();
+  R.Load.assign(
+      N + 1, SmallVector<unsigned, 0>(SchedModel.getNumProcResourceKinds(), 0));
 
   // Where the path is in time. Region I is the stretch between the issue of
   // the step before it and the issue of the step after it; the last region
@@ -701,6 +742,7 @@ void AMDGPUGlobalSchedImpl::regionsOf(const DepGraph &G,
     unsigned First = Lo.lookup(MI) + 1, Last = Hi.lookup(MI);
     unsigned Asap = T.Start.lookup(MI);
     R.Wins.push_back({MI, First, Last, Past, Asap, Asap + T.Slack.lookup(MI)});
+    pipesOf(*MI, R.Load[Past]);
     for (unsigned I = First; I <= Last; ++I)
       ++R.Count[I];
   }
@@ -992,9 +1034,25 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
     dbgs() << "amdgpu-global-sched: regions: " << R.size() << " regions, "
            << Num << " to place, " << Slots << " legal slots, "
            << (Num ? Slots / Num : 0) << " regions each\n";
-    for (auto [I, C] : enumerate(R.Count))
-      dbgs() << "amdgpu-global-sched:   region " << I << ": " << C << " legal, "
-             << Busy[I] << " now, " << R.cap(I) << " cycles\n";
+    // What the pipes say. A region is as long as the path makes it, but no
+    // shorter than its busiest pipe has to be held for, and that floor holds
+    // whatever order the region is put in.
+    uint64_t ByPath = 0, ByPipe = 0;
+    unsigned Over = 0;
+    for (unsigned I = 0; I < R.size(); ++I) {
+      auto [Need, Pipe] = R.floorOf(I);
+      ByPath += R.cap(I);
+      ByPipe += std::max(R.cap(I), Need);
+      Over += Need > R.cap(I);
+      dbgs() << "amdgpu-global-sched:   region " << I << ": " << R.Count[I]
+             << " legal, " << Busy[I] << " now, " << R.cap(I) << " cycles";
+      if (Need)
+        dbgs() << ", needs " << Need << " " << SchedModel.getResourceName(Pipe);
+      dbgs() << "\n";
+    }
+    dbgs() << "amdgpu-global-sched: resources: " << ByPath
+           << " cycles by dependence, " << ByPipe << " by pipe, " << Over
+           << " of " << R.size() << " regions short\n";
 
     // Of the legal places, the ones that cost nothing. Dependence says where
     // an instruction may go; this says where it may go without waiting, and
