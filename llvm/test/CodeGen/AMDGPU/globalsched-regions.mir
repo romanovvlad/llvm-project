@@ -1,0 +1,49 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 -run-pass=amdgpu-global-sched \
+# RUN:     -debug-only=amdgpu-global-sched -o /dev/null %s 2>&1 | FileCheck %s
+# REQUIRES: asserts
+
+# What the chain is for: a path of N instructions cuts the function into N+1
+# regions, one before each step and one after the last, and everything else
+# has to be put into one of them.
+#
+# The step path here is %0 -> %1 -> ... -> %5 -> S_ENDPGM, seven steps, so
+# eight regions.
+# The two instructions not on it are a chain of their own, %6 -> %7, which
+# nothing on the path reads and which reads nothing on the path. Dependence
+# therefore allows them into any region except the last -- they are read by
+# the S_ENDPGM that ends the path, so they cannot go after it -- and only
+# the order between the two of them is forced.
+#
+# That last number is the whole point of counting. Regions are only a useful
+# cut if instructions are legal in few of them; if everything is legal
+# everywhere, the path has not narrowed the problem at all.
+
+# CHECK: amdgpu-global-sched: regions: 8 regions, 2 to place, 14 legal slots, 7 regions each
+# CHECK-NEXT: region 0: 2 legal
+# CHECK-NEXT: region 1: 2 legal
+# CHECK-NEXT: region 2: 2 legal
+# CHECK-NEXT: region 3: 2 legal
+# CHECK-NEXT: region 4: 2 legal
+# CHECK-NEXT: region 5: 2 legal
+# CHECK-NEXT: region 6: 2 legal
+# CHECK-NEXT: region 7: 0 legal
+
+---
+name:            region_fill
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $vgpr0, $vgpr1
+
+    %0:vgpr_32 = COPY $vgpr0
+    %1:vgpr_32 = V_ADD_U32_e32 %0, %0, implicit $exec
+    %2:vgpr_32 = V_ADD_U32_e32 %1, %1, implicit $exec
+    %3:vgpr_32 = V_ADD_U32_e32 %2, %2, implicit $exec
+    %4:vgpr_32 = V_ADD_U32_e32 %3, %3, implicit $exec
+    %5:vgpr_32 = V_ADD_U32_e32 %4, %4, implicit $exec
+
+    %6:vgpr_32 = COPY $vgpr1
+    %7:vgpr_32 = V_XOR_B32_e32 %6, %6, implicit $exec
+
+    S_ENDPGM 0, implicit %5, implicit %7
+...

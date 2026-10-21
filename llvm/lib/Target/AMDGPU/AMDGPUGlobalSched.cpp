@@ -121,6 +121,14 @@ private:
   SmallVector<MachineInstr *, 0> chainPath(MachineFunction &MF, bool ByCycles,
                                            unsigned &Weight) const;
 
+  /// A path of N instructions cuts the function into N+1 regions: one before
+  /// each step and one after the last. \p Count is filled with how many of
+  /// the instructions not on \p Path dependence allows into each region, and
+  /// \p Width with how many regions each such instruction is allowed into.
+  void regionsOf(MachineFunction &MF, ArrayRef<MachineInstr *> Path,
+                 SmallVectorImpl<unsigned> &Count,
+                 SmallVectorImpl<unsigned> &Width) const;
+
   /// Earliest and latest start time of each instruction, in cycles, as the
   /// dependence graph alone allows. Fills \p Start and \p Slack and returns
   /// the length of the longest chain.
@@ -412,6 +420,69 @@ AMDGPUGlobalSchedImpl::chainPath(MachineFunction &MF, bool ByCycles,
   return Path;
 }
 
+void AMDGPUGlobalSchedImpl::regionsOf(MachineFunction &MF,
+                                      ArrayRef<MachineInstr *> Path,
+                                      SmallVectorImpl<unsigned> &Count,
+                                      SmallVectorImpl<unsigned> &Width) const {
+  // Number the steps of the path, and the N+1 regions between them, so that
+  // region I is the gap immediately before step I and region N is what comes
+  // after the last step.
+  DenseMap<const MachineInstr *, unsigned> Step;
+  for (auto [I, MI] : enumerate(Path))
+    Step[MI] = I;
+  const int N = Path.size();
+
+  Count.assign(N + 1, 0);
+  Width.clear();
+
+  SmallVector<MachineInstr *, 0> Order = orderOf(MF);
+
+  // The last step that has to come before an instruction. If an operand is a
+  // step, that step does; otherwise whatever had to precede the operand does.
+  DenseMap<const MachineInstr *, int> Lo;
+  for (MachineInstr *MI : Order) {
+    int L = -1;
+    if (!MI->isPHI())
+      for (const MachineOperand &MO : MI->uses()) {
+        if (!MO.isReg() || !MO.getReg().isVirtual())
+          continue;
+        MachineInstr *Def = MRI->getVRegDef(MO.getReg());
+        auto It = Step.find(Def);
+        L = std::max(L, It != Step.end() ? (int)It->second : Lo.lookup(Def));
+      }
+    Lo[MI] = L;
+  }
+
+  // And the first step that has to come after it. N means none does.
+  DenseMap<const MachineInstr *, int> Hi;
+  for (MachineInstr *MI : reverse(Order)) {
+    int H = N;
+    for (const MachineOperand &MO : MI->defs()) {
+      if (!MO.isReg() || !MO.getReg().isVirtual())
+        continue;
+      for (MachineInstr &Use : MRI->use_nodbg_instructions(MO.getReg())) {
+        if (Use.isPHI())
+          continue;
+        auto It = Step.find(&Use);
+        H = std::min(H, It != Step.end() ? (int)It->second : Hi.lookup(&Use));
+      }
+    }
+    Hi[MI] = H;
+  }
+
+  // An instruction may sit anywhere after the last step it needs and before
+  // the first step that needs it. That window is a run of whole regions, and
+  // it is never empty, since the path is a path.
+  for (MachineInstr *MI : Order) {
+    if (Step.count(MI))
+      continue;
+    int First = Lo.lookup(MI) + 1, Last = Hi.lookup(MI);
+    Width.push_back(Last - First + 1);
+    for (int I = First; I <= Last; ++I)
+      ++Count[I];
+  }
+}
+
 unsigned AMDGPUGlobalSchedImpl::chainOf(
     MachineFunction &MF, DenseMap<const MachineInstr *, unsigned> &Start,
     DenseMap<const MachineInstr *, unsigned> &Slack) const {
@@ -629,6 +700,20 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
            << " before, " << After.size() << " after, " << Both << " both, "
            << NumInstrs - OnPath.size() - Before.size() - After.size() + Both
            << " unordered\n";
+
+    // The step path is the one worth anchoring to: it has the most steps, so
+    // it cuts the function into the most regions.
+    SmallVector<unsigned, 0> Count, Width;
+    regionsOf(MF, BySteps, Count, Width);
+    unsigned Slots = 0;
+    for (unsigned W : Width)
+      Slots += W;
+    dbgs() << "amdgpu-global-sched: regions: " << Count.size() << " regions, "
+           << Width.size() << " to place, " << Slots << " legal slots, "
+           << (Width.empty() ? 0 : Slots / Width.size()) << " regions each\n";
+    for (auto [I, C] : enumerate(Count))
+      dbgs() << "amdgpu-global-sched:   region " << I << ": " << C
+             << " legal\n";
 
     for (MachineInstr *MI : ByCycles)
       dbgs() << "amdgpu-global-sched:   on path "
