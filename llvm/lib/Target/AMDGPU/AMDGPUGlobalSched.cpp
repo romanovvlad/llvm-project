@@ -487,7 +487,12 @@ void AMDGPUGlobalSchedImpl::buildDeps(MachineFunction &MF, DepGraph &G) const {
             ReadsSince[Unit].push_back(&MI);
             continue;
           }
-          if (Def)
+          // A write nobody reads still clobbers, so whatever came before it
+          // keeps its edge to it -- but nothing has to come after it, so it
+          // need not wait for the write before. Without this every SALU
+          // instruction of a block is on one chain through the SCC none of
+          // them meant to write.
+          if (Def && !MO.isDead())
             G.add(Def, &MI, 1);
           for (MachineInstr *R : ReadsSince[Unit])
             G.add(R, &MI, 1);

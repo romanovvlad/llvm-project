@@ -11,9 +11,7 @@
 # There is no better number available, so the instruction's own latency is
 # the answer for both of its results.
 
-# The three SALU instructions each write SCC, which orders them whether or
-# not anybody reads it, so the chain runs through all of them.
-# CHECK: amdgpu-global-sched: chain: 6 instrs, 4 cycles, 6 critical
+# CHECK: amdgpu-global-sched: chain: 6 instrs, 3 cycles, 6 critical
 
 ---
 name:            chain_multidef
