@@ -22,12 +22,23 @@
 # dependence allows into one region only. There are none. Such an instruction
 # would sit between two consecutive steps, which are joined by an edge, so
 # routing the path through it would make the longest path longer still.
+#
+# A step also need not be joined to the one before it by an edge -- being
+# ordered against it is all a step has to be, and a dependence path says that
+# too. So the hops may skip, and here they do: the chain that minimises the
+# ordering over all the regions reaches seven steps, but the chain that
+# minimises the single worst region gets there in three, because the four it
+# leaves out separated nothing and cost placement to say so.
+#
+# Seven is then a floor and not a starting point. Both objectives are solved
+# exactly over every chain, so no cut by any chain leaves a region smaller.
 
 # CHECK: amdgpu-global-sched: search: {{.*}} largest region 11
-# CHECK: amdgpu-global-sched: frame: {{.*}} largest region 7
+# CHECK: amdgpu-global-sched: frame: 7 on the path, {{.*}} largest region 7
+# CHECK: amdgpu-global-sched: worst: 3 on the path, {{.*}} largest region 7
 
 ---
-name:            frame
+name:            coarse_cut
 tracksRegLiveness: true
 body:             |
   bb.0:
