@@ -1,0 +1,81 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 -run-pass=amdgpu-global-sched \
+# RUN:     -debug-only=amdgpu-global-sched -o /dev/null %s 2>&1 | FileCheck %s
+# REQUIRES: asserts
+
+# Why a coarse region cannot simply be split again.
+#
+# Two chains here, each six long, each threaded through six instructions that
+# wait for nothing but the copy. The six MULs are one chain and the six ADDs
+# are the other, and no instruction of either is ordered against any
+# instruction of the other.
+#
+# A cut takes one of them -- here the ADDs -- and that leaves the twelve
+# instructions of the other half in a single region. Splitting that region
+# again by a chain found inside it looks like it must work, and locally it
+# does: the region reports that it falls into six pieces of one, so there
+# would be nothing left to order at all.
+#
+# It does not work, and both measures of the best possible cut say so: the
+# chain that minimises the ordering over every region and the chain that
+# minimises the single worst region both leave a region of twelve. The sub-cut
+# is not a cut. Its steps are the MULs, the enclosing cut's steps are the
+# ADDs, and those are not ordered against each other, so there is no order in
+# which the two sets of walls can both stand.
+#
+# What the sub-cut really did was pick an interleaving. That is why its saving
+# is not free and does not show up as ordering removed: the ordering falls to
+# nothing and seventeen bits appear beside it as the choice of which piece
+# each instruction belongs to. Merging two regions and cutting again moves the
+# bits; it does not remove them.
+
+# The region a cut cannot reach, and what it looks like from inside.
+# CHECK: region 1: 18 legal, 12 now, {{.*}} cut into 6 biggest 1 hard 1
+
+# Yet no cut gets below twelve, by either exact measure.
+# CHECK: amdgpu-global-sched: search: {{.*}} largest region 12
+
+# And the sub-cut's saving is a move, not a saving.
+# CHECK: amdgpu-global-sched: cut: 6 pieces, 0 bits to order them, 17 to choose which, largest 12 -> 1
+
+# CHECK: amdgpu-global-sched: frame: {{.*}} largest region 12
+# CHECK: amdgpu-global-sched: worst: 2 on the path, {{.*}} largest region 12
+
+---
+name:            two_chains
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $vgpr0
+
+    %0:vgpr_32 = COPY $vgpr0
+
+    ; One chain, threaded through six instructions that wait for nothing.
+    %1:vgpr_32 = V_MUL_U32_U24_e32 %0, %0, implicit $exec
+    %30:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %2:vgpr_32 = V_MUL_U32_U24_e32 %1, %1, implicit $exec
+    %31:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %3:vgpr_32 = V_MUL_U32_U24_e32 %2, %2, implicit $exec
+    %32:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %4:vgpr_32 = V_MUL_U32_U24_e32 %3, %3, implicit $exec
+    %33:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %5:vgpr_32 = V_MUL_U32_U24_e32 %4, %4, implicit $exec
+    %34:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %6:vgpr_32 = V_MUL_U32_U24_e32 %5, %5, implicit $exec
+    %35:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+
+    ; And another, ordered against nothing in the first.
+    %10:vgpr_32 = V_ADD_U32_e32 %0, %0, implicit $exec
+    %40:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %11:vgpr_32 = V_ADD_U32_e32 %10, %10, implicit $exec
+    %41:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %12:vgpr_32 = V_ADD_U32_e32 %11, %11, implicit $exec
+    %42:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %13:vgpr_32 = V_ADD_U32_e32 %12, %12, implicit $exec
+    %43:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %14:vgpr_32 = V_ADD_U32_e32 %13, %13, implicit $exec
+    %44:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %15:vgpr_32 = V_ADD_U32_e32 %14, %14, implicit $exec
+    %45:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+
+    S_ENDPGM 0, implicit %6, implicit %15, implicit %30, implicit %31, implicit %32, implicit %33, implicit %34, implicit %35, implicit %40, implicit %41, implicit %42, implicit %43, implicit %44, implicit %45
+...
