@@ -1,0 +1,86 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 -run-pass=amdgpu-global-sched \
+# RUN:     -debug-only=amdgpu-global-sched -o /dev/null %s 2>&1 | FileCheck %s
+# REQUIRES: asserts
+
+# What a frame costs when its walls are not ordered against each other.
+#
+# The same two chains as globalsched-hierarchy.mir: six MULs and six ADDs,
+# each threaded through six instructions that wait for nothing but the copy,
+# and no instruction of either chain ordered against any instruction of the
+# other. A cut takes one chain and leaves the twelve instructions of the
+# other half standing in a single region, and no cut does better, because to
+# put a MUL on the wall it would have to be ordered against the ADDs and it
+# is not.
+#
+# That looked like the end of it. A second chain cannot join the first in a
+# line, so the two were treated as unusable together -- the order they would
+# have to be laid in is not one dependence gives, and taking the order they
+# happen to sit in now is taking the schedule we started from as an answer.
+#
+# It is usable, and the thing that was missing was not a proof but a price. A
+# schedule settles the order of the walls; what a frame of unordered walls
+# costs over an ordered one is just the number of orders they could have been
+# settled into. For two chains that is the ways to interleave them, and here
+# it is twelve bits -- eight walls and six walls, C(14,8).
+#
+# Pay it and the region of twelve is gone.
+
+# One chain alone: the region of twelve it cannot reach.
+# CHECK: amdgpu-global-sched: frame: 8 on the path, {{.*}} 79 total, largest region 12
+
+# The recursion that cuts every region by a chain of its own finds the same
+# fourteen walls here, in two chains, and is priced the same way. On a real
+# kernel it finds hundreds, in scores of chains, and the price stays a line
+# item rather than a barrier.
+# CHECK: amdgpu-global-sched: meltall: 14 walls in 2 chains, longest 8, 12 to place, 12 to interleave + 44 = 56 bits largest region 1
+
+# A grid of the two -- a coordinate against each chain -- does break the
+# region up, and costs exactly what it saves. Every instruction is charged the
+# full width of the second chain, including the ones ordered against none of
+# it, and here that is the whole saving.
+# CHECK: amdgpu-global-sched: grid: 8 down 6 across, 12 cells hold 12, line 79 bits largest 12, grid 12 to interleave + 67 to place + 0 to order = 79 bits largest 1
+
+# The same two chains melted into one line of fourteen walls, with the
+# interleaving bought once instead of charged to everybody. Seventy-nine bits
+# become fifty-six, and nothing is left to order anywhere.
+# CHECK: amdgpu-global-sched: melt: 14 walls in one line, 12 to place, 12 to interleave + 44 = 56 bits largest region 1
+
+---
+name:            two_chains
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $vgpr0
+
+    %0:vgpr_32 = COPY $vgpr0
+
+    ; One chain, threaded through six instructions that wait for nothing.
+    %1:vgpr_32 = V_MUL_U32_U24_e32 %0, %0, implicit $exec
+    %30:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %2:vgpr_32 = V_MUL_U32_U24_e32 %1, %1, implicit $exec
+    %31:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %3:vgpr_32 = V_MUL_U32_U24_e32 %2, %2, implicit $exec
+    %32:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %4:vgpr_32 = V_MUL_U32_U24_e32 %3, %3, implicit $exec
+    %33:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %5:vgpr_32 = V_MUL_U32_U24_e32 %4, %4, implicit $exec
+    %34:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %6:vgpr_32 = V_MUL_U32_U24_e32 %5, %5, implicit $exec
+    %35:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+
+    ; And another, ordered against nothing in the first.
+    %10:vgpr_32 = V_ADD_U32_e32 %0, %0, implicit $exec
+    %40:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %11:vgpr_32 = V_ADD_U32_e32 %10, %10, implicit $exec
+    %41:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %12:vgpr_32 = V_ADD_U32_e32 %11, %11, implicit $exec
+    %42:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %13:vgpr_32 = V_ADD_U32_e32 %12, %12, implicit $exec
+    %43:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %14:vgpr_32 = V_ADD_U32_e32 %13, %13, implicit $exec
+    %44:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %15:vgpr_32 = V_ADD_U32_e32 %14, %14, implicit $exec
+    %45:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+
+    S_ENDPGM 0, implicit %6, implicit %15, implicit %30, implicit %31, implicit %32, implicit %33, implicit %34, implicit %35, implicit %40, implicit %41, implicit %42, implicit %43, implicit %44, implicit %45
+...

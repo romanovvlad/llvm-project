@@ -67,7 +67,22 @@ using namespace llvm;
 
 #define DEBUG_TYPE "amdgpu-global-sched"
 
+static cl::opt<unsigned> RefineSpan(
+    "amdgpu-global-sched-refine-span", cl::Hidden, cl::init(8),
+    cl::desc("Most walls a single refinement step may dissolve at once"));
+
 namespace {
+
+/// One depth of the recursive cut: the regions that exist at that depth, how
+/// much of them a cut of their own can anchor, and what is left to order.
+struct Tier {
+  unsigned Regions = 0; ///< regions at this depth
+  unsigned Steps = 0;   ///< instructions the cuts at this depth anchor
+  unsigned Insts = 0;   ///< instructions those regions hold
+  unsigned Worst = 0;   ///< instructions in the biggest of them
+  unsigned Stuck = 0;   ///< regions with no order inside left to cut by
+  double Bits = 0;      ///< bits to order every region at this depth
+};
 
 /// Where one instruction is allowed to live.
 ///
@@ -306,6 +321,41 @@ private:
   /// \p In is everything in that region, in topological order.
   void reduceOf(const DepGraph &G, ArrayRef<MachineInstr *> In, const Timing &T,
                 Reduction &Out) const;
+
+  /// The instructions of \p In, which must be in topological order, grouped so
+  /// that nothing in one group is ordered against anything in another. Each
+  /// group's size and its longest chain land in \p Out, biggest group first.
+  void partsOf(const DepGraph &G, ArrayRef<MachineInstr *> In,
+               SmallVectorImpl<std::pair<unsigned, unsigned>> &Out) const;
+
+  /// Cut \p In by the chain that best spreads it, cut each region that chain
+  /// makes the same way, and keep going until a region has no order inside it
+  /// left to cut by. One Tier per depth lands in \p Out.
+  /// Every region the recursion stops on has its size appended to \p Leaves:
+  /// those are what a search would still have to order outright.
+  /// Every instruction a cut at any depth put on a chain lands in \p Anchors.
+  void anchorsOf(const DepGraph &G, ArrayRef<MachineInstr *> In,
+                 SmallVectorImpl<Tier> &Out, SmallVectorImpl<unsigned> &Leaves,
+                 SmallVectorImpl<MachineInstr *> &Anchors) const;
+
+  /// Make \p Anchors finer without making it unsound. A wall an instruction
+  /// is not ordered against can be dissolved and a chain of such instructions
+  /// put in its place, and every surviving wall stays ordered against every
+  /// new one. \p MaxSpan is the most walls dissolved at once. Returns the
+  /// rounds that found something.
+  unsigned refineOf(const DepGraph &G, const Timing &T, unsigned MaxSpan,
+                    SmallVectorImpl<MachineInstr *> &Anchors) const;
+
+  /// What two chains cost in place of one. \p Down and \p Across must each be
+  /// ordered within themselves; nothing need order one against the other.
+  /// Prints what the frame they make costs against what \p Down costs alone.
+  void gridOf(const DepGraph &G, const Timing &T, ArrayRef<MachineInstr *> Down,
+              ArrayRef<MachineInstr *> Across) const;
+
+  /// What \p Walls cost as a frame when nothing promises its walls are
+  /// ordered against each other. \p Walls must be in topological order.
+  void meltOf(const DepGraph &G, const Timing &T,
+              ArrayRef<MachineInstr *> Walls) const;
 
   /// Earliest and latest start time of each instruction, in cycles, as \p G
   /// alone allows. Fills \p Start and \p Slack and returns the length of the
@@ -790,6 +840,74 @@ void AMDGPUGlobalSchedImpl::regionsOf(const DepGraph &G,
   }
 }
 
+/// The chain through a set of instructions that leaves the least ordering to
+/// do. \p Up gives each instruction's predecessors as positions in a
+/// topological order of the set, \p How chooses what is minimized, and \p Bits
+/// comes back with what is left. The answer is positions into that same order.
+static SmallVector<unsigned, 0> spreadIn(ArrayRef<SmallVector<unsigned, 0>> Up,
+                                         Spread How, double &Bits) {
+  const unsigned N = Up.size();
+
+  // Who must come before each instruction, including at a remove. This is a
+  // square of bits, so it is only built while that is cheap; past that the
+  // edges alone are used and the answer is merely a chain that exists, not
+  // the best one.
+  const bool Closed = N <= ClosureLimit;
+  SmallVector<BitVector, 0> Before;
+  if (Closed) {
+    Before.assign(N, BitVector(N));
+    for (unsigned I = 0; I != N; ++I)
+      for (unsigned J : Up[I]) {
+        Before[I] |= Before[J];
+        Before[I].set(J);
+      }
+  }
+
+  SmallVector<double, 0> Cost(N, 0);
+  SmallVector<int, 0> Prev(N, -1);
+
+  int End = -1;
+  Bits = std::numeric_limits<double>::max();
+  for (unsigned I = 0; I != N; ++I) {
+    // Starting the chain here leaves everything before it in one region.
+    double C = bitsOf(I);
+    int From = -1;
+
+    auto Hop = [&](unsigned J) {
+      double E = How == Spread::Total ? Cost[J] + bitsOf(I - J - 1)
+                                      : std::max(Cost[J], bitsOf(I - J - 1));
+      if (E < C) {
+        C = E;
+        From = J;
+      }
+    };
+    if (Closed) {
+      for (unsigned J : Before[I].set_bits())
+        Hop(J);
+    } else {
+      for (unsigned J : Up[I])
+        Hop(J);
+    }
+
+    Cost[I] = C;
+    Prev[I] = From;
+
+    // And ending it here leaves everything after it in one region.
+    double Full = How == Spread::Total ? C + bitsOf(N - 1 - I)
+                                       : std::max(C, bitsOf(N - 1 - I));
+    if (Full < Bits) {
+      Bits = Full;
+      End = I;
+    }
+  }
+
+  SmallVector<unsigned, 0> Path;
+  for (int I = End; I >= 0; I = Prev[I])
+    Path.push_back(I);
+  std::reverse(Path.begin(), Path.end());
+  return Path;
+}
+
 SmallVector<MachineInstr *, 0>
 AMDGPUGlobalSchedImpl::spreadPath(const DepGraph &G, Spread How,
                                   double &Bits) const {
@@ -818,70 +936,548 @@ AMDGPUGlobalSchedImpl::spreadPath(const DepGraph &G, Spread How,
   // lets a cut be made finer where it is coarse -- a step whose two sides are
   // both crowded can be dropped for a longer run of instructions spanning the
   // same stretch, even though no edge joins that run to what bounds it.
-  const unsigned N = G.Order.size();
   DenseMap<const MachineInstr *, unsigned> Pos;
   for (auto [I, MI] : enumerate(G.Order))
     Pos[MI] = I;
 
-  // Who must come before each instruction, including at a remove. This is a
-  // square of bits, so it is only built while that is cheap; past that the
-  // edges alone are used and the answer is merely a chain that exists, not
-  // the best one.
-  const bool Closed = N <= ClosureLimit;
-  SmallVector<BitVector, 0> Before;
-  if (Closed) {
-    Before.assign(N, BitVector(N));
-    for (unsigned I = 0; I != N; ++I)
-      for (const Dep &P : G.preds(G.Order[I])) {
-        unsigned J = Pos.lookup(P.Other);
-        Before[I] |= Before[J];
-        Before[I].set(J);
-      }
-  }
-
-  SmallVector<double, 0> Cost(N, 0);
-  SmallVector<int, 0> Prev(N, -1);
-
-  int End = -1;
-  Bits = std::numeric_limits<double>::max();
-  for (unsigned I = 0; I != N; ++I) {
-    // Starting the chain here leaves everything before it in one region.
-    double C = bitsOf(I);
-    int From = -1;
-
-    auto Hop = [&](unsigned J) {
-      double E = How == Spread::Total ? Cost[J] + bitsOf(I - J - 1)
-                                      : std::max(Cost[J], bitsOf(I - J - 1));
-      if (E < C) {
-        C = E;
-        From = J;
-      }
-    };
-    if (Closed) {
-      for (unsigned J : Before[I].set_bits())
-        Hop(J);
-    } else {
-      for (const Dep &P : G.preds(G.Order[I]))
-        Hop(Pos.lookup(P.Other));
-    }
-
-    Cost[I] = C;
-    Prev[I] = From;
-
-    // And ending it here leaves everything after it in one region.
-    double Full = How == Spread::Total ? C + bitsOf(N - 1 - I)
-                                       : std::max(C, bitsOf(N - 1 - I));
-    if (Full < Bits) {
-      Bits = Full;
-      End = I;
-    }
-  }
+  SmallVector<SmallVector<unsigned, 0>, 0> Up(G.Order.size());
+  for (auto [I, MI] : enumerate(G.Order))
+    for (const Dep &P : G.preds(MI))
+      Up[I].push_back(Pos.lookup(P.Other));
 
   SmallVector<MachineInstr *, 0> Path;
-  for (int I = End; I >= 0; I = Prev[I])
+  for (unsigned I : spreadIn(Up, How, Bits))
     Path.push_back(G.Order[I]);
-  std::reverse(Path.begin(), Path.end());
   return Path;
+}
+
+void AMDGPUGlobalSchedImpl::partsOf(
+    const DepGraph &G, ArrayRef<MachineInstr *> In,
+    SmallVectorImpl<std::pair<unsigned, unsigned>> &Out) const {
+  // Peeling the longest chain off a region, then the longest chain of what is
+  // left, says nothing about whether the second is ordered against the first,
+  // so it cannot answer what the region is made of. The order itself can. Two
+  // instructions belong together when one has to come before the other,
+  // however far apart; the components of that relation are what a schedule
+  // may interleave freely, and no one chain can anchor two of them at once.
+  Out.clear();
+  const unsigned N = In.size();
+  if (!N)
+    return;
+
+  DenseMap<const MachineInstr *, unsigned> Idx;
+  for (auto [I, MI] : enumerate(In))
+    Idx[MI] = I;
+
+  SmallVector<SmallVector<unsigned, 4>, 0> Up(N);
+  for (auto [I, MI] : enumerate(In))
+    for (const Dep &P : G.preds(MI))
+      if (auto It = Idx.find(P.Other); It != Idx.end())
+        Up[I].push_back(It->second);
+
+  // Who must come before whom at any remove. \p In is topological, so one
+  // forward sweep settles it.
+  SmallVector<BitVector, 0> Before(N, BitVector(N));
+  for (unsigned I = 0; I != N; ++I)
+    for (unsigned J : Up[I]) {
+      Before[I] |= Before[J];
+      Before[I].set(J);
+    }
+
+  // Joined by that relation, not by the edges: two instructions sharing a
+  // predecessor are still free to go in either order, so they are not in the
+  // same group merely for sharing it.
+  SmallVector<unsigned, 0> Root(N);
+  for (unsigned I = 0; I != N; ++I)
+    Root[I] = I;
+  auto Find = [&](unsigned I) {
+    while (Root[I] != I)
+      I = Root[I] = Root[Root[I]];
+    return I;
+  };
+  for (unsigned I = 0; I != N; ++I)
+    for (unsigned J : Before[I].set_bits())
+      Root[Find(I)] = Find(J);
+
+  // How big each group is and the longest run inside it.
+  SmallVector<unsigned, 0> Deep(N, 1);
+  DenseMap<unsigned, std::pair<unsigned, unsigned>> Group;
+  for (unsigned I = 0; I != N; ++I) {
+    for (unsigned J : Up[I])
+      Deep[I] = std::max(Deep[I], Deep[J] + 1);
+    std::pair<unsigned, unsigned> &G2 = Group[Find(I)];
+    ++G2.first;
+    G2.second = std::max(G2.second, Deep[I]);
+  }
+
+  for (const auto &KV : Group)
+    Out.push_back(KV.second);
+  llvm::sort(Out, std::greater<std::pair<unsigned, unsigned>>());
+}
+
+void AMDGPUGlobalSchedImpl::anchorsOf(
+    const DepGraph &G, ArrayRef<MachineInstr *> In, SmallVectorImpl<Tier> &Out,
+    SmallVectorImpl<unsigned> &Leaves,
+    SmallVectorImpl<MachineInstr *> &Anchors) const {
+  // A cut is one chain, and a chain follows one thread of the order at a
+  // time. Whatever it had to leave behind lands in a region, and that region
+  // is a smaller instance of the same problem, so it is cut by the chain that
+  // best spreads it in turn. Each cut is chosen over the reachability order
+  // rather than the edges, so a step may skip: wherever a wall of the level
+  // above fell in the wrong place, the level below is free to span it.
+  //
+  // This is a picture of the function, not a finer cut of it. Nothing says a
+  // sub-cut's steps are ordered against the walls around them, and which
+  // piece an instruction falls into is read off where it sits today, which is
+  // a choice rather than a fact.
+  Out.clear();
+  Leaves.clear();
+  Anchors.clear();
+  SmallVector<SmallVector<MachineInstr *, 0>, 0> Work;
+  Work.emplace_back(In.begin(), In.end());
+
+  while (!Work.empty()) {
+    SmallVector<SmallVector<MachineInstr *, 0>, 0> Next;
+    Tier L;
+    for (const SmallVector<MachineInstr *, 0> &Set : Work) {
+      const unsigned M = Set.size();
+      ++L.Regions;
+      L.Insts += M;
+      L.Worst = std::max(L.Worst, M);
+      L.Bits += bitsOf(M);
+
+      DenseMap<const MachineInstr *, unsigned> Idx;
+      for (auto [I, MI] : enumerate(Set))
+        Idx[MI] = I;
+
+      SmallVector<SmallVector<unsigned, 0>, 0> Up(M);
+      for (auto [I, MI] : enumerate(Set))
+        for (const Dep &P : G.preds(MI))
+          if (auto It = Idx.find(P.Other); It != Idx.end())
+            Up[I].push_back(It->second);
+
+      // No order in here at all, so there is nothing to cut by. Cutting by
+      // position anyway would only be choosing an interleaving, and the
+      // region would never stop being cut.
+      if (none_of(Up, [](ArrayRef<unsigned> P) { return !P.empty(); })) {
+        ++L.Stuck;
+        Leaves.push_back(M);
+        continue;
+      }
+
+      double Bits = 0;
+      SmallVector<unsigned, 0> Steps = spreadIn(Up, Spread::Total, Bits);
+
+      // A single step is not a chain: nothing ordered it against anything, so
+      // where it falls is position again rather than dependence. Two is the
+      // least that anchors.
+      if (Steps.size() < 2) {
+        ++L.Stuck;
+        Leaves.push_back(M);
+        continue;
+      }
+      L.Steps += Steps.size();
+      for (unsigned S : Steps)
+        Anchors.push_back(Set[S]);
+
+      BitVector OnPath(M);
+      for (unsigned S : Steps)
+        OnPath.set(S);
+
+      SmallVector<SmallVector<MachineInstr *, 0>, 0> Pieces(Steps.size() + 1);
+      unsigned Past = 0;
+      for (unsigned I = 0; I != M; ++I) {
+        if (OnPath.test(I)) {
+          ++Past;
+          continue;
+        }
+        Pieces[Past].push_back(Set[I]);
+      }
+      for (SmallVector<MachineInstr *, 0> &P : Pieces)
+        if (!P.empty())
+          Next.push_back(std::move(P));
+    }
+    Out.push_back(L);
+    Work = std::move(Next);
+  }
+}
+
+unsigned AMDGPUGlobalSchedImpl::refineOf(
+    const DepGraph &G, const Timing &T, unsigned MaxSpan,
+    SmallVectorImpl<MachineInstr *> &Anchors) const {
+  // A frame is only worth having while every two of its walls are ordered
+  // against each other: that is what makes the regions between them a
+  // coordinate system, and what makes every schedule still describable once
+  // the frame is imposed. Cutting a region by a chain found inside it throws
+  // that away, because nothing said the chain was ordered against the walls
+  // around it.
+  //
+  // There is a way to get finer without losing it. An instruction's window
+  // names the walls it is *not* ordered against -- it depends on the wall
+  // before the window and the wall after it depends on the instruction, and
+  // only the walls strictly inside are free. So if every wall inside the
+  // window is dissolved, that instruction is ordered against every wall that
+  // remains, and may become one itself. Take a chain of such instructions,
+  // put it where the dissolved walls were, and the frame is finer and still
+  // sound. It pays whenever the chain is longer than the run it replaces.
+  const unsigned N = G.Order.size();
+  if (N > ClosureLimit)
+    return 0;
+
+  DenseMap<const MachineInstr *, unsigned> Seat;
+  for (auto [I, MI] : enumerate(G.Order))
+    Seat[MI] = I;
+
+  // Who must come before whom. The graph never changes, so this is built once
+  // rather than in every round.
+  SmallVector<BitVector, 0> Before(N, BitVector(N));
+  for (unsigned I = 0; I != N; ++I)
+    for (const Dep &P : G.preds(G.Order[I])) {
+      unsigned J = Seat.lookup(P.Other);
+      Before[I] |= Before[J];
+      Before[I].set(J);
+    }
+
+  // What makes a frame good is not how many walls it has. Adding a wall only
+  // takes something away if the instructions around it are ordered against
+  // it, and makes every other window one region wider if they are not. So a
+  // step is taken when it lowers the bits it takes to name a schedule in the
+  // frame, and not merely when it leaves more walls standing than it
+  // dissolved. One step at a time, best first: with a single span in flight
+  // there is no way for one swap to dissolve the wall another one leaned on.
+  auto BitsOf = [&](ArrayRef<MachineInstr *> Frame, unsigned &Worst) {
+    Regions R;
+    regionsOf(G, Frame, T, R);
+    SmallVector<unsigned, 0> Busy(R.size(), 0);
+    double Bits = 0;
+    for (const Window &W : R.Wins) {
+      ++Busy[W.Here];
+      Bits += std::log2(W.Last - W.First + 1);
+    }
+    Worst = 0;
+    for (unsigned B : Busy) {
+      Bits += bitsOf(B);
+      Worst = std::max(Worst, B);
+    }
+    return Bits;
+  };
+
+  unsigned Rounds = 0;
+  for (unsigned Pass = 0; Pass != 64; ++Pass) {
+    Regions R;
+    regionsOf(G, Anchors, T, R);
+    const unsigned Walls = Anchors.size();
+
+    unsigned Worst = 0;
+    const double Have = BitsOf(Anchors, Worst);
+
+    double Best = Have;
+    unsigned BestWorst = Worst, BestAt = 0, BestSpan = 0, BestLen = 0;
+    SmallVector<MachineInstr *, 0> Take;
+
+    for (unsigned Span = 1; Span <= RefineSpan && Span <= Walls; ++Span) {
+      for (unsigned A = 0; A + Span <= Walls; ++A) {
+        // Everything whose unordered walls all lie inside this span. Wins is
+        // built by a sweep over a topological order, so this stays in one.
+        SmallVector<MachineInstr *, 0> Cand;
+        for (const Window &W : R.Wins)
+          if (W.First >= A && W.Last <= A + Span)
+            Cand.push_back(W.MI);
+        if (Cand.empty())
+          continue;
+
+        // The longest run of them that is ordered. Being ordered at a remove
+        // is enough: a wall only has to come after the one before it, not
+        // immediately after.
+        const unsigned M = Cand.size();
+        SmallVector<unsigned, 0> Deep(M, 1);
+        SmallVector<int, 0> Back(M, -1);
+        unsigned Long = 0;
+        int End = -1;
+        for (unsigned I = 0; I != M; ++I) {
+          unsigned Pi = Seat.lookup(Cand[I]);
+          for (unsigned J = 0; J != I; ++J)
+            if (Before[Pi].test(Seat.lookup(Cand[J])) &&
+                Deep[J] + 1 > Deep[I]) {
+              Deep[I] = Deep[J] + 1;
+              Back[I] = J;
+            }
+          if (Deep[I] > Long) {
+            Long = Deep[I];
+            End = I;
+          }
+        }
+        if (End < 0)
+          continue;
+
+        SmallVector<MachineInstr *, 0> Try;
+        for (unsigned I = 0; I != Walls; ++I)
+          if (I < A || I >= A + Span)
+            Try.push_back(Anchors[I]);
+        for (int I = End; I >= 0; I = Back[I])
+          Try.push_back(Cand[I]);
+
+        // A new wall depends on the wall before the span it replaced and is
+        // depended on by the wall after it, so it already sits between them
+        // in any topological order. Sorting by that order is enough to put
+        // the frame back in sequence.
+        llvm::sort(Try, [&](const MachineInstr *X, const MachineInstr *Y) {
+          return Seat.lookup(X) < Seat.lookup(Y);
+        });
+
+        unsigned Bad = 0;
+        double Bits = BitsOf(Try, Bad);
+        if (Bits >= Best)
+          continue;
+        Best = Bits;
+        BestWorst = Bad;
+        BestAt = A;
+        BestSpan = Span;
+        BestLen = Long;
+        Take = std::move(Try);
+      }
+    }
+
+    if (Take.empty())
+      break;
+
+    Anchors.assign(Take.begin(), Take.end());
+    ++Rounds;
+
+    LLVM_DEBUG(dbgs() << "amdgpu-global-sched: refine: round " << Rounds
+                      << ", wall " << BestAt << " span " << BestSpan
+                      << " -> chain " << BestLen << ", " << Walls << " -> "
+                      << Anchors.size() << " walls, "
+                      << (uint64_t)std::llround(Have) << " -> "
+                      << (uint64_t)std::llround(Best)
+                      << " bits, largest region " << BestWorst << "\n");
+  }
+
+  // The whole point was to stay sound, so say whether it did. Every wall must
+  // come before every later wall; a pair that does not is a frame that has
+  // stopped being a coordinate system.
+  LLVM_DEBUG({
+    unsigned Bad = 0;
+    for (unsigned I = 0; I != Anchors.size(); ++I)
+      for (unsigned J = I + 1; J != Anchors.size(); ++J)
+        if (!Before[Seat.lookup(Anchors[J])].test(Seat.lookup(Anchors[I])))
+          ++Bad;
+    dbgs() << "amdgpu-global-sched: refine: done, " << Rounds << " rounds, "
+           << Anchors.size() << " walls, " << Bad << " unordered pairs\n";
+  });
+
+  return Rounds;
+}
+
+void AMDGPUGlobalSchedImpl::gridOf(const DepGraph &G, const Timing &T,
+                                   ArrayRef<MachineInstr *> Down,
+                                   ArrayRef<MachineInstr *> Across) const {
+  // A single chain can only be cut by instructions ordered against all of it,
+  // and a region it cannot cut is exactly one whose contents are ordered
+  // against each other and against nothing on the chain. Two chains do not
+  // have that problem, because they are never laid in one line: each
+  // instruction gets a coordinate against each chain, and the pair names a
+  // cell of a grid.
+  //
+  // That still names a schedule. Walking a schedule from start to end, the
+  // count of passed steps of either chain only ever goes up, so the cells it
+  // visits climb the grid in one direction and form a chain of their own. What
+  // has to be paid for on top is which way they climb -- the interleaving of
+  // the two chains, one choice of p+q steps of which p are Down's.
+  Regions RD, RA;
+  regionsOf(G, Down, T, RD);
+  regionsOf(G, Across, T, RA);
+
+  DenseMap<const MachineInstr *, const Window *> Side;
+  for (const Window &W : RA.Wins)
+    Side[W.MI] = &W;
+
+  // What the one chain costs, over everything it does not itself contain.
+  double Line = 0;
+  SmallVector<unsigned, 0> Busy(RD.size(), 0);
+  for (const Window &W : RD.Wins) {
+    ++Busy[W.Here];
+    Line += std::log2(W.Last - W.First + 1);
+  }
+  unsigned LineWorst = 0;
+  for (unsigned B : Busy) {
+    Line += bitsOf(B);
+    LineWorst = std::max(LineWorst, B);
+  }
+
+  // And what the grid costs over the same schedules. An instruction on either
+  // chain is a wall and is not placed: the chains' own steps are fixed against
+  // each other by the interleaving, so they are paid for there and nowhere
+  // else.
+  double Place = 0;
+  DenseMap<uint64_t, unsigned> Cell;
+  unsigned Free = 0;
+  for (const Window &W : RD.Wins) {
+    auto It = Side.find(W.MI);
+    if (It == Side.end())
+      continue;
+    const Window &V = *It->second;
+    ++Free;
+    Place += std::log2(W.Last - W.First + 1);
+    Place += std::log2(V.Last - V.First + 1);
+    ++Cell[(uint64_t)W.Here * RA.size() + V.Here];
+  }
+
+  double Order = 0;
+  unsigned GridWorst = 0;
+  for (const auto &C : Cell) {
+    Order += bitsOf(C.second);
+    GridWorst = std::max(GridWorst, C.second);
+  }
+
+  const double P = Down.size(), Q = Across.size();
+  const double Mix =
+      (std::lgamma(P + Q + 1.0) - std::lgamma(P + 1.0) - std::lgamma(Q + 1.0)) /
+      std::log(2.0);
+
+  LLVM_DEBUG(dbgs() << "amdgpu-global-sched: grid: " << Down.size() << " down "
+                    << Across.size() << " across, " << Cell.size()
+                    << " cells hold " << Free << ", line "
+                    << (uint64_t)std::llround(Line) << " bits largest "
+                    << LineWorst << ", grid " << (uint64_t)std::llround(Mix)
+                    << " to interleave + " << (uint64_t)std::llround(Place)
+                    << " to place + " << (uint64_t)std::llround(Order)
+                    << " to order = "
+                    << (uint64_t)std::llround(Mix + Place + Order)
+                    << " bits largest " << GridWorst << "\n");
+
+  // A grid charges every instruction for both coordinates, and the second one
+  // is nearly free information for most of them: an instruction ordered
+  // against nothing in Across pays the full width of Across to say so. There
+  // is a cheaper way to spend the same interleaving. Once it is bought, the
+  // order of all p+q walls is settled, and settled walls are a line -- so lay
+  // them in one and charge the line, with no second coordinate for anyone.
+  //
+  // This is also what was missing before. A frame whose walls are not ordered
+  // against each other was never unusable, only unpriced: the price is Mix,
+  // and nothing else about it changes.
+  DenseMap<const MachineInstr *, unsigned> Seat;
+  for (auto [I, MI] : enumerate(G.Order))
+    Seat[MI] = I;
+  SmallVector<MachineInstr *, 0> Merged(Down.begin(), Down.end());
+  append_range(Merged, Across);
+  llvm::sort(Merged, [&](const MachineInstr *X, const MachineInstr *Y) {
+    return Seat.lookup(X) < Seat.lookup(Y);
+  });
+
+  Regions RM;
+  regionsOf(G, Merged, T, RM);
+  double Melt = 0;
+  SmallVector<unsigned, 0> Held(RM.size(), 0);
+  for (const Window &W : RM.Wins) {
+    ++Held[W.Here];
+    Melt += std::log2(W.Last - W.First + 1);
+  }
+  unsigned MeltWorst = 0;
+  for (unsigned B : Held) {
+    Melt += bitsOf(B);
+    MeltWorst = std::max(MeltWorst, B);
+  }
+
+  LLVM_DEBUG(dbgs() << "amdgpu-global-sched: melt: " << Merged.size()
+                    << " walls in one line, " << RM.Wins.size() << " to place, "
+                    << (uint64_t)std::llround(Mix) << " to interleave + "
+                    << (uint64_t)std::llround(Melt) << " = "
+                    << (uint64_t)std::llround(Mix + Melt)
+                    << " bits largest region " << MeltWorst << "\n");
+}
+
+void AMDGPUGlobalSchedImpl::meltOf(const DepGraph &G, const Timing &T,
+                                   ArrayRef<MachineInstr *> Walls) const {
+  // Walls that are not ordered against each other were never unusable, only
+  // unpriced. A schedule settles their order, so what a frame of them costs
+  // on top of an ordered one is the number of orders they could have been
+  // settled into -- and that is bounded by cutting them into chains, because
+  // a chain's own order is forced and only the interleaving is free.
+  const unsigned M = Walls.size();
+  if (M < 2 || G.Order.size() > ClosureLimit || M > 1500)
+    return;
+
+  DenseMap<const MachineInstr *, unsigned> Seat;
+  for (auto [I, MI] : enumerate(G.Order))
+    Seat[MI] = I;
+
+  // Who must come before whom, over the walls alone.
+  SmallVector<BitVector, 0> Before(M, BitVector(M));
+  {
+    DenseMap<const MachineInstr *, unsigned> Spot;
+    for (auto [I, MI] : enumerate(Walls))
+      Spot[MI] = I;
+    SmallVector<BitVector, 0> Full(G.Order.size(), BitVector(G.Order.size()));
+    for (unsigned I = 0, N = G.Order.size(); I != N; ++I)
+      for (const Dep &P : G.preds(G.Order[I])) {
+        unsigned J = Seat.lookup(P.Other);
+        Full[I] |= Full[J];
+        Full[I].set(J);
+      }
+    for (unsigned I = 0; I != M; ++I) {
+      unsigned Pi = Seat.lookup(Walls[I]);
+      for (unsigned J = 0; J != M; ++J)
+        if (Full[Pi].test(Seat.lookup(Walls[J])))
+          Before[I].set(J);
+    }
+  }
+
+  // Peel the longest chain again and again. Any cover will do for a bound,
+  // and a greedy one keeps the count of chains down, which is what the
+  // interleaving is paid per.
+  BitVector Left(M, true);
+  SmallVector<unsigned, 0> Cover;
+  while (Left.any()) {
+    SmallVector<unsigned, 0> Deep(M, 0);
+    SmallVector<int, 0> Back(M, -1);
+    unsigned Best = 0;
+    int End = -1;
+    for (unsigned I = 0; I != M; ++I) {
+      if (!Left.test(I))
+        continue;
+      Deep[I] = 1;
+      for (unsigned J = 0; J != I; ++J)
+        if (Left.test(J) && Before[I].test(J) && Deep[J] + 1 > Deep[I]) {
+          Deep[I] = Deep[J] + 1;
+          Back[I] = J;
+        }
+      if (Deep[I] > Best) {
+        Best = Deep[I];
+        End = I;
+      }
+    }
+    for (int I = End; I >= 0; I = Back[I])
+      Left.reset(I);
+    Cover.push_back(Best);
+  }
+
+  double Mix = std::lgamma((double)M + 1.0);
+  for (unsigned C : Cover)
+    Mix -= std::lgamma((double)C + 1.0);
+  Mix /= std::log(2.0);
+
+  Regions R;
+  regionsOf(G, Walls, T, R);
+  double Bits = 0;
+  SmallVector<unsigned, 0> Held(R.size(), 0);
+  for (const Window &W : R.Wins) {
+    ++Held[W.Here];
+    Bits += std::log2(W.Last - W.First + 1);
+  }
+  unsigned Worst = 0;
+  for (unsigned B : Held) {
+    Bits += bitsOf(B);
+    Worst = std::max(Worst, B);
+  }
+
+  LLVM_DEBUG(dbgs() << "amdgpu-global-sched: meltall: " << M << " walls in "
+                    << Cover.size() << " chains, longest " << Cover[0] << ", "
+                    << R.Wins.size() << " to place, "
+                    << (uint64_t)std::llround(Mix) << " to interleave + "
+                    << (uint64_t)std::llround(Bits) << " = "
+                    << (uint64_t)std::llround(Mix + Bits)
+                    << " bits largest region " << Worst << "\n");
 }
 
 void AMDGPUGlobalSchedImpl::reduceOf(const DepGraph &G,
@@ -1549,6 +2145,129 @@ bool AMDGPUGlobalSchedImpl::run(MachineFunction &MF) {
            << (uint64_t)std::llround(Order3) << " to order, "
            << (uint64_t)std::llround(Place3 + Order3)
            << " total, largest region " << Worst3 << "\n";
+
+    // The biggest region of the best cut is the one that matters, so ask what
+    // it is made of before asking what cutting it again would do.
+    unsigned Big = 0;
+    for (auto [I, B] : enumerate(Busy2))
+      if (B > Busy2[Big])
+        Big = I;
+
+    SmallVector<MachineInstr *, 0> Inside;
+    for (const Window &W : R2.Wins)
+      if (W.Here == Big)
+        Inside.push_back(W.MI);
+
+    SmallVector<std::pair<unsigned, unsigned>, 0> Parts;
+    partsOf(G, Inside, Parts);
+
+    dbgs() << "amdgpu-global-sched: parts: " << Inside.size() << " instrs, "
+           << Parts.size() << " groups, sizes";
+    for (unsigned I = 0, E = std::min<size_t>(8, Parts.size()); I != E; ++I)
+      dbgs() << " " << Parts[I].first;
+    dbgs() << ", chains";
+    for (unsigned I = 0, E = std::min<size_t>(8, Parts.size()); I != E; ++I)
+      dbgs() << " " << Parts[I].second;
+    dbgs() << "\n";
+
+    SmallVector<Tier, 0> Depths;
+    SmallVector<unsigned, 0> Leaves;
+    SmallVector<MachineInstr *, 0> Anchors;
+    anchorsOf(G, G.Order, Depths, Leaves, Anchors);
+    for (auto [D, L] : enumerate(Depths))
+      dbgs() << "amdgpu-global-sched: tree: depth " << D << ", " << L.Regions
+             << " regions, " << L.Insts << " instrs, " << L.Steps
+             << " anchored, biggest " << L.Worst << ", " << L.Stuck
+             << " with no order left, " << (uint64_t)std::llround(L.Bits)
+             << " bits to order\n";
+
+    // Where the recursion stopped is where a search would have to start. The
+    // depths above count regions still being cut, so they say nothing about
+    // what is left when the cutting is over; these do.
+    llvm::sort(Leaves, std::greater<unsigned>());
+    unsigned LeafInstrs = 0, LeafMany = 0;
+    double LeafBits = 0;
+    for (unsigned S : Leaves) {
+      LeafInstrs += S;
+      LeafMany += S >= 8;
+      LeafBits += bitsOf(S);
+    }
+    dbgs() << "amdgpu-global-sched: leaves: " << Leaves.size() << " regions, "
+           << LeafInstrs << " instrs, biggest "
+           << (Leaves.empty() ? 0 : Leaves[0]) << ", " << LeafMany
+           << " of 8 or more, " << (uint64_t)std::llround(LeafBits)
+           << " bits to order, sizes";
+    for (unsigned I = 0, E = std::min<size_t>(12, Leaves.size()); I != E; ++I)
+      dbgs() << " " << Leaves[I];
+    dbgs() << "\n";
+
+    // Which leaf an instruction ended up in was read off where it sits today,
+    // not off what dependence allows, and each depth of the recursion made
+    // one more such choice. Holding every anchor the recursion produced and
+    // then asking the question properly says how much of that was forced.
+    // The anchors are not a chain -- two of them from different depths need
+    // not be ordered at all -- but they are still fixed points in a known
+    // order, which is all that bounding a window needs.
+    DenseMap<const MachineInstr *, unsigned> Seat;
+    for (auto [I, MI] : enumerate(G.Order))
+      Seat[MI] = I;
+    llvm::sort(Anchors, [&](const MachineInstr *A, const MachineInstr *B) {
+      return Seat.lookup(A) < Seat.lookup(B);
+    });
+
+    Regions R4;
+    regionsOf(G, Anchors, T, R4);
+    meltOf(G, T, Anchors);
+
+    unsigned Only = 0, Widest = 0;
+    double Place4 = 0;
+    for (const Window &W : R4.Wins) {
+      unsigned Wide = W.Last - W.First + 1;
+      Only += Wide == 1;
+      Widest = std::max(Widest, Wide);
+      Place4 += std::log2(Wide);
+    }
+    dbgs() << "amdgpu-global-sched: pinned: " << Anchors.size() << " anchors, "
+           << R4.Wins.size() << " to place, " << Only
+           << " with nowhere else to go, widest " << Widest << ", "
+           << (uint64_t)std::llround(Place4) << " bits to place\n";
+
+    // And the same question asked the way that keeps the frame sound: start
+    // from the best single chain and only ever swap walls for walls that are
+    // ordered against everything left.
+    SmallVector<MachineInstr *, 0> Fine = BySpread;
+    refineOf(G, T, RefineSpan, Fine);
+
+    // The second chain goes through whatever the first one left biggest.
+    Regions RF;
+    regionsOf(G, Fine, T, RF);
+    SmallVector<unsigned, 0> Load(RF.size(), 0);
+    for (const Window &W : RF.Wins)
+      ++Load[W.Here];
+    unsigned Big5 = 0;
+    for (auto [I, B] : enumerate(Load))
+      if (B > Load[Big5])
+        Big5 = I;
+    SmallVector<MachineInstr *, 0> Inside5;
+    for (const Window &W : RF.Wins)
+      if (W.Here == Big5)
+        Inside5.push_back(W.MI);
+
+    DenseMap<const MachineInstr *, unsigned> Spot;
+    for (auto [I, MI] : enumerate(Inside5))
+      Spot[MI] = I;
+    SmallVector<SmallVector<unsigned, 0>, 0> Climb(Inside5.size());
+    for (auto [I, MI] : enumerate(Inside5))
+      for (const Dep &P : G.preds(MI))
+        if (auto It = Spot.find(P.Other); It != Spot.end())
+          Climb[I].push_back(It->second);
+
+    double Spent = 0;
+    SmallVector<MachineInstr *, 0> Across;
+    for (unsigned S : spreadIn(Climb, Spread::Total, Spent))
+      Across.push_back(Inside5[S]);
+    if (!Across.empty())
+      gridOf(G, T, Fine, Across);
 
     // And what each choice costs. A slot of a region issues at a known cycle,
     // so putting an instruction there has a price that can be read off before

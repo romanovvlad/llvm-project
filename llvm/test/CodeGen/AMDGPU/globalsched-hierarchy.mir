@@ -79,3 +79,28 @@ body:             |
 
     S_ENDPGM 0, implicit %6, implicit %15, implicit %30, implicit %31, implicit %32, implicit %33, implicit %34, implicit %35, implicit %40, implicit %41, implicit %42, implicit %43, implicit %44, implicit %45
 ...
+
+
+
+# First cut
+
+# region 0
+#    %1:vgpr_32 = V_MUL_U32_U24_e32 %0, %0, implicit $exec
+# region 1
+#    %2:vgpr_32 = V_MUL_U32_U24_e32 %1, %1, implicit $exec
+# region 2
+#    %3:vgpr_32 = V_MUL_U32_U24_e32 %2, %2, implicit $exec
+#    %4:vgpr_32 = V_MUL_U32_U24_e32 %3, %3, implicit $exec
+#    %5:vgpr_32 = V_MUL_U32_U24_e32 %4, %4, implicit $exec
+#    %6:vgpr_32 = V_MUL_U32_U24_e32 %5, %5, implicit $exec
+
+# %30 = can live in any region after %1 = 
+# %31 = can live in any region after %2 =
+# and so on
+
+# the second chain should be ordered, but can be spread acroos any regions after the region where we place %10 = 
+
+
+
+
+

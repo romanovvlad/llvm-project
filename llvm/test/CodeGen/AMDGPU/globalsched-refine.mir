@@ -1,0 +1,71 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 -run-pass=amdgpu-global-sched \
+# RUN:     -debug-only=amdgpu-global-sched -o /dev/null %s 2>&1 | FileCheck %s
+# REQUIRES: asserts
+
+# Making a cut finer without making it wrong.
+#
+# A frame earns its keep by having every two of its walls ordered against each
+# other. That is what makes the regions between them a coordinate system: an
+# instruction's legal placements are a run of whole regions, and no schedule
+# stops being describable once the frame is imposed. Cutting a region by a
+# chain found inside it loses that, because nothing said the chain was ordered
+# against the walls on either side of it.
+#
+# There is a way to get finer and keep it. An instruction's window names
+# exactly the walls it is not ordered against -- it depends on the wall before
+# the window, and the wall after the window depends on it, so only the walls
+# strictly inside are free of it. Dissolve all of those and the instruction is
+# ordered against every wall that remains, which makes it fit to be a wall
+# itself. A chain of such instructions can take their place, and the frame is
+# finer and still sound. It is worth doing only when the chain is longer than
+# the run of walls it replaces.
+#
+# Here it is worth nothing, and that is the point. Two chains, each six long,
+# each threaded through six instructions that wait only for the copy. Whichever
+# chain the cut takes, every instruction left over is unordered against every
+# wall of it, so no window is narrow enough for any span to pay: replacing a
+# run of walls would always cost at least as many as it bought. The refinement
+# declines, which is the right answer, and the frame it hands back is still
+# ordered end to end.
+
+# CHECK: amdgpu-global-sched: refine: done, 0 rounds, {{[0-9]+}} walls, 0 unordered pairs
+
+---
+name:            two_chains
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $vgpr0
+
+    %0:vgpr_32 = COPY $vgpr0
+
+    ; One chain, threaded through six instructions that wait for nothing.
+    %1:vgpr_32 = V_MUL_U32_U24_e32 %0, %0, implicit $exec
+    %30:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %2:vgpr_32 = V_MUL_U32_U24_e32 %1, %1, implicit $exec
+    %31:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %3:vgpr_32 = V_MUL_U32_U24_e32 %2, %2, implicit $exec
+    %32:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %4:vgpr_32 = V_MUL_U32_U24_e32 %3, %3, implicit $exec
+    %33:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %5:vgpr_32 = V_MUL_U32_U24_e32 %4, %4, implicit $exec
+    %34:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %6:vgpr_32 = V_MUL_U32_U24_e32 %5, %5, implicit $exec
+    %35:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+
+    ; And another, ordered against nothing in the first.
+    %10:vgpr_32 = V_ADD_U32_e32 %0, %0, implicit $exec
+    %40:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %11:vgpr_32 = V_ADD_U32_e32 %10, %10, implicit $exec
+    %41:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %12:vgpr_32 = V_ADD_U32_e32 %11, %11, implicit $exec
+    %42:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %13:vgpr_32 = V_ADD_U32_e32 %12, %12, implicit $exec
+    %43:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %14:vgpr_32 = V_ADD_U32_e32 %13, %13, implicit $exec
+    %44:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+    %15:vgpr_32 = V_ADD_U32_e32 %14, %14, implicit $exec
+    %45:vgpr_32 = V_XOR_B32_e32 %0, %0, implicit $exec
+
+    S_ENDPGM 0, implicit %6, implicit %15, implicit %30, implicit %31, implicit %32, implicit %33, implicit %34, implicit %35, implicit %40, implicit %41, implicit %42, implicit %43, implicit %44, implicit %45
+...
