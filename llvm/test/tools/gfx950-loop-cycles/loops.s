@@ -3,25 +3,25 @@
 // Two loops that retire the same FLOPs, so the only thing separating them is
 // how long the matrix pipe sits idle.
 //
-// `dense` issues its MFMAs back to back. A 32x32x8 f16 MFMA is 4 passes, so it
-// holds the matrix pipe for 16 cycles, and the three scalar instructions beside
-// it fit inside that window for free. The loop costs exactly what the math
-// costs, which is the most it can do: 2*32*32*8 flops in 16 cycles, 1024
-// flop/cycle, 100% of its own ceiling.
+// `dense` issues its MFMAs back to back. A 32x32x8 f16 MFMA is 8 passes, so it
+// holds the matrix pipe for 32 cycles, and the two scalar instructions and the
+// taken branch beside it fit inside that window for free. The loop costs
+// exactly what the math costs, which is the most it can do: 2*32*32*8 flops in
+// 32 cycles, 512 flop/cycle, 100% of its own ceiling.
 //
 // `stalled` is the same MFMA and the same flops, with ten more VALU
-// instructions beside it. Issue alone is then 56 cycles an iteration, 40 of
-// which the matrix pipe cannot use, and the flop rate falls to under a third.
+// instructions beside it. Issue alone is then 72 cycles an iteration, 40 of
+// which the matrix pipe cannot use, and the flop rate falls by more than half.
 // Nothing here waits on anything -- the loop is slower purely because a wave
 // issues one instruction every 4 cycles whatever it is.
 
 // CHECK: kernel {{.*}}cy/xdl flop/cy  peak
 // CHECK-NEXT: ---
-// CHECK-NEXT: loops.s 5-18 14 1 0 224 56 64 160 0 0 0 0 3.50 293 29%
-// CHECK-NEXT: loops.s 0-3 4 1 0 64 16 64 0 0 0 0 0 1.00 1024 100%
+// CHECK-NEXT: loops.s 5-18 14 1 0 288 72 128 160 0 0 0 0 2.25 228 44%
+// CHECK-NEXT: loops.s 0-3 4 1 0 128 32 128 0 0 0 0 0 1.00 512 100%
 // CHECK-NEXT: ---
-// CHECK-NEXT: 2 loops 288 cycles busy: xdl 128 (44%) valu 160 (56%)
-// CHECK-NEXT: 131072 flops 455 flop/cycle, 44% of what these MFMAs can do (1024 flop/cycle)
+// CHECK-NEXT: 2 loops 416 cycles busy: xdl 256 (62%) valu 160 (38%)
+// CHECK-NEXT: 131072 flops 315 flop/cycle, 62% of what these MFMAs can do (512 flop/cycle)
 
 dense:
 .LBB0_1:
