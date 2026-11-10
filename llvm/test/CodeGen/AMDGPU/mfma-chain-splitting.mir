@@ -26,33 +26,33 @@ body: |
   ; CHECK: bb.0:
   ; CHECK-NEXT:   successors: %bb.1(0x80000000)
   ; CHECK-NEXT: {{  $}}
-  ; CHECK-NEXT:   %p0:vreg_1024 = IMPLICIT_DEF
-  ; CHECK-NEXT:   %agpr0:areg_1024 = IMPLICIT_DEF
+  ; CHECK-NEXT:   %p8:vreg_64_align2 = IMPLICIT_DEF
+  ; CHECK-NEXT:   %agpr7:areg_256 = IMPLICIT_DEF
   ; CHECK-NEXT:   %initA:areg_128_align2 = IMPLICIT_DEF
   ; CHECK-NEXT:   %initB:areg_128_align2 = IMPLICIT_DEF
-  ; CHECK-NEXT:   %initC:areg_128_align2 = IMPLICIT_DEF
+  ; CHECK-NEXT:   %initC:vreg_128_align2 = IMPLICIT_DEF
   ; CHECK-NEXT:   %initD:vreg_128_align2 = IMPLICIT_DEF
   ; CHECK-NEXT:   %initE:vreg_128_align2 = IMPLICIT_DEF
   ; CHECK-NEXT:   %initF:vreg_128_align2 = IMPLICIT_DEF
   ; CHECK-NEXT:   %initG:vreg_128_align2 = IMPLICIT_DEF
   ; CHECK-NEXT:   %initH:vreg_128_align2 = IMPLICIT_DEF
-  ; CHECK-NEXT:   %agpr1:areg_1024 = IMPLICIT_DEF
-  ; CHECK-NEXT:   %p1:vreg_1024 = IMPLICIT_DEF
-  ; CHECK-NEXT:   %agpr2:areg_1024 = IMPLICIT_DEF
-  ; CHECK-NEXT:   %p2:vreg_1024 = IMPLICIT_DEF
-  ; CHECK-NEXT:   %agpr3:areg_1024 = IMPLICIT_DEF
-  ; CHECK-NEXT:   %p3:vreg_1024 = IMPLICIT_DEF
-  ; CHECK-NEXT:   %agpr4:areg_1024 = IMPLICIT_DEF
-  ; CHECK-NEXT:   %p4:vreg_1024 = IMPLICIT_DEF
-  ; CHECK-NEXT:   %agpr5:areg_1024 = IMPLICIT_DEF
   ; CHECK-NEXT:   %initI:vreg_128_align2 = IMPLICIT_DEF
   ; CHECK-NEXT:   %initJ:vreg_128_align2 = IMPLICIT_DEF
-  ; CHECK-NEXT:   %agpr7:areg_256 = IMPLICIT_DEF
-  ; CHECK-NEXT:   %p8:vreg_64_align2 = IMPLICIT_DEF
   ; CHECK-NEXT:   %initK:vreg_128_align2 = IMPLICIT_DEF
   ; CHECK-NEXT:   %initL:vreg_128_align2 = IMPLICIT_DEF
   ; CHECK-NEXT:   %initM:vreg_128_align2 = IMPLICIT_DEF
+  ; CHECK-NEXT:   %p0:vreg_1024 = IMPLICIT_DEF
+  ; CHECK-NEXT:   %p1:vreg_1024 = IMPLICIT_DEF
+  ; CHECK-NEXT:   %p2:vreg_1024 = IMPLICIT_DEF
+  ; CHECK-NEXT:   %p3:vreg_1024 = IMPLICIT_DEF
+  ; CHECK-NEXT:   %p4:vreg_1024 = IMPLICIT_DEF
   ; CHECK-NEXT:   %p5:vreg_1024 = IMPLICIT_DEF
+  ; CHECK-NEXT:   %agpr0:areg_1024 = IMPLICIT_DEF
+  ; CHECK-NEXT:   %agpr1:areg_1024 = IMPLICIT_DEF
+  ; CHECK-NEXT:   %agpr2:areg_1024 = IMPLICIT_DEF
+  ; CHECK-NEXT:   %agpr3:areg_1024 = IMPLICIT_DEF
+  ; CHECK-NEXT:   %agpr4:areg_1024 = IMPLICIT_DEF
+  ; CHECK-NEXT:   %agpr5:areg_1024 = IMPLICIT_DEF
   ; CHECK-NEXT:   SCHED_BARRIER 0
   ; CHECK-NEXT:   S_BRANCH %bb.1
   ; CHECK-NEXT: {{  $}}
@@ -64,9 +64,9 @@ body: |
   ; CHECK-NEXT:   %b0:areg_128_align2 = V_MFMA_F32_16X16X32_F16_e64 undef %s0:vreg_128_align2, undef %s1:vreg_128_align2, %initB, 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   %b1:areg_128_align2 = V_MFMA_F32_16X16X32_F16_e64 undef %s0:vreg_128_align2, undef %s1:vreg_128_align2, %b0, 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   %b2:areg_128_align2 = V_MFMA_F32_16X16X32_F16_e64 undef %s0:vreg_128_align2, undef %s1:vreg_128_align2, %b1, 0, 0, 0, implicit $mode, implicit $exec
-  ; CHECK-NEXT:   %c0:areg_128_align2 = V_MFMA_F32_16X16X32_F16_e64 undef %s0:vreg_128_align2, undef %s1:vreg_128_align2, %initC, 0, 0, 0, implicit $mode, implicit $exec
-  ; CHECK-NEXT:   %c1:areg_128_align2 = V_MFMA_F32_16X16X32_F16_e64 undef %s0:vreg_128_align2, undef %s1:vreg_128_align2, %c0, 0, 0, 0, implicit $mode, implicit $exec
-  ; CHECK-NEXT:   %c2:areg_128_align2 = V_MFMA_F32_16X16X32_F16_e64 undef %s0:vreg_128_align2, undef %s1:vreg_128_align2, %c1, 0, 0, 0, implicit $mode, implicit $exec
+  ; CHECK-NEXT:   %c0:vreg_128_align2 = V_MFMA_F32_16X16X32_F16_vgprcd_e64 undef %s0:vreg_128_align2, undef %s1:vreg_128_align2, %initC, 0, 0, 0, implicit $mode, implicit $exec
+  ; CHECK-NEXT:   %c1:vreg_128_align2 = V_MFMA_F32_16X16X32_F16_vgprcd_e64 undef %s0:vreg_128_align2, undef %s1:vreg_128_align2, %c0, 0, 0, 0, implicit $mode, implicit $exec
+  ; CHECK-NEXT:   %c2:vreg_128_align2 = V_MFMA_F32_16X16X32_F16_vgprcd_e64 undef %s0:vreg_128_align2, undef %s1:vreg_128_align2, %c1, 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   %d0:vreg_128_align2 = V_MFMA_F32_16X16X32_F16_vgprcd_e64 undef %s0:vreg_128_align2, undef %s1:vreg_128_align2, %initD, 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   %d1:vreg_128_align2 = V_MFMA_F32_16X16X32_F16_vgprcd_e64 undef %s0:vreg_128_align2, undef %s1:vreg_128_align2, %d0, 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   %d2:vreg_128_align2 = V_MFMA_F32_16X16X32_F16_vgprcd_e64 undef %s0:vreg_128_align2, undef %s1:vreg_128_align2, %d1, 0, 0, 0, implicit $mode, implicit $exec
@@ -94,10 +94,9 @@ body: |
   ; CHECK-NEXT:   %l0:vreg_128_align2 = V_MFMA_F32_16X16X32_F16_vgprcd_e64 undef %s0:vreg_128_align2, undef %s1:vreg_128_align2, %initL, 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   %l1:vreg_128_align2 = V_MFMA_F32_16X16X32_F16_vgprcd_e64 undef %s0:vreg_128_align2, undef %s1:vreg_128_align2, %l0, 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   [[COPY:%[0-9]+]]:vreg_128_align2 = COPY %b2
-  ; CHECK-NEXT:   %vaddB:vgpr_32 = V_ADD_U32_e32 [[COPY]].sub0, undef %extra:vgpr_32, implicit $exec
   ; CHECK-NEXT:   %l2:vreg_128_align2 = V_MFMA_F32_16X16X32_F16_vgprcd_e64 undef %s0:vreg_128_align2, undef %s1:vreg_128_align2, %l1, 0, 0, 0, implicit $mode, implicit $exec
-  ; CHECK-NEXT:   [[COPY1:%[0-9]+]]:vreg_128_align2 = COPY %c2
-  ; CHECK-NEXT:   %vaddC:vgpr_32 = V_ADD_U32_e32 [[COPY1]].sub0, undef %extra2:vgpr_32, implicit $exec
+  ; CHECK-NEXT:   %vaddB:vgpr_32 = V_ADD_U32_e32 [[COPY]].sub0, undef %extra:vgpr_32, implicit $exec
+  ; CHECK-NEXT:   %vaddC:vgpr_32 = V_ADD_U32_e32 %c2.sub0, undef %extra2:vgpr_32, implicit $exec
   ; CHECK-NEXT:   %vaddD:vgpr_32 = V_ADD_U32_e32 %d2.sub0, undef %extra3:vgpr_32, implicit $exec
   ; CHECK-NEXT:   %m0:vreg_128_align2 = V_MFMA_F32_16X16X32_F16_vgprcd_e64 undef %s0:vreg_128_align2, undef %s1:vreg_128_align2, %initM, 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   %vaddE:vgpr_32 = V_ADD_U32_e32 %e2.sub0, undef %extra4:vgpr_32, implicit $exec

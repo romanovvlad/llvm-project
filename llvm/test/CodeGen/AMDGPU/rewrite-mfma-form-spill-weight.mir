@@ -44,8 +44,7 @@ body:             |
   ; CHECK-NEXT:   successors: %bb.2(0x80000000)
   ; CHECK-NEXT: {{  $}}
   ; CHECK-NEXT:   undef %acc.sub0:vreg_128_align2 = V_ADD_U32_e32 %e0, %e0, implicit $exec
-  ; CHECK-NEXT:   [[COPY:%[0-9]+]]:areg_128_align2 = COPY %acc
-  ; CHECK-NEXT:   %a0:areg_128_align2 = V_MFMA_F32_16X16X32_F16_e64 %m0, %m1, [[COPY]], 0, 0, 0, implicit $mode, implicit $exec
+  ; CHECK-NEXT:   %a0:vreg_128_align2 = V_MFMA_F32_16X16X32_F16_vgprcd_e64 %m0, %m1, %acc, 0, 0, 0, implicit $mode, implicit $exec
   ; CHECK-NEXT:   S_NOP 0, implicit %a0
   ; CHECK-NEXT:   S_BRANCH %bb.2
   ; CHECK-NEXT: {{  $}}
