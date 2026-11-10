@@ -533,6 +533,13 @@ static int getRegFreeDelta(const SUnit *SU) {
   return Delta;
 }
 
+int HardwareUnitInfo::getCachedRegFreeDelta(const SUnit *SU) {
+  std::optional<int> &Slot = (*RegFreeCache)[SU->NodeNum];
+  if (!Slot)
+    Slot = getRegFreeDelta(SU);
+  return *Slot;
+}
+
 void HardwareUnitInfo::updatePrioritySUsWith(SUnit *Cand) {
   if (PrioritySUs.empty()) {
     PrioritySUs.insert(Cand);
@@ -546,8 +553,8 @@ void HardwareUnitInfo::updatePrioritySUsWith(SUnit *Cand) {
                     << ") vs existing SU(" << Existing->NodeNum << ")\n");
 
   if (!PriorityHeadFrees)
-    PriorityHeadFrees = getRegFreeDelta(Existing);
-  int CandFrees = getRegFreeDelta(Cand);
+    PriorityHeadFrees = getCachedRegFreeDelta(Existing);
+  int CandFrees = getCachedRegFreeDelta(Cand);
   LLVM_DEBUG(dbgs() << "      Existing: frees=" << *PriorityHeadFrees
                     << "  Candidate: frees=" << CandFrees << "\n");
 
@@ -654,7 +661,22 @@ unsigned CandidateHeuristics::getHWUICyclesForMI(MachineInstr *MI) {
   return getMaxBlockingCycles(SchedModel->resolveSchedClass(MI), MI);
 }
 
+void CandidateHeuristics::invalidateRegFreeDeltas(const SUnit *SU) {
+  RegFreeCache[SU->NodeNum].reset();
+  for (const SDep &Pred : SU->Preds) {
+    if (Pred.getKind() != SDep::Data || !Pred.getReg())
+      continue;
+    // Scheduling SU lowers the number of unscheduled readers of the register
+    // for everything else that reads it from the same producer.
+    for (const SDep &Succ : Pred.getSUnit()->Succs)
+      if (Succ.getKind() == SDep::Data && Succ.getReg() == Pred.getReg() &&
+          !Succ.getSUnit()->isBoundaryNode())
+        RegFreeCache[Succ.getSUnit()->NodeNum].reset();
+  }
+}
+
 void CandidateHeuristics::updateForScheduling(SUnit *SU) {
+  invalidateRegFreeDeltas(SU);
   MachineInstr *MI = SU->getInstr();
   HardwareUnitInfo *HWUI = getHWUIFromFlavor(classifyFlavor(*MI, *SII));
   assert(HWUI);
@@ -674,10 +696,12 @@ void CandidateHeuristics::initialize(ScheduleDAGMI *SchedDAG,
   SII = static_cast<const SIInstrInfo *>(DAG->TII);
 
   HWUInfo.resize(static_cast<int>(InstructionFlavor::NUM_FLAVORS));
+  RegFreeCache.assign(DAG->SUnits.size(), std::nullopt);
 
   for (unsigned I = 0; I < HWUInfo.size(); I++) {
     HWUInfo[I].reset();
     HWUInfo[I].setType(I);
+    HWUInfo[I].setRegFreeCache(&RegFreeCache);
   }
 
   HWUInfo[static_cast<int>(InstructionFlavor::WMMA)].setProducesCoexecWindow(
