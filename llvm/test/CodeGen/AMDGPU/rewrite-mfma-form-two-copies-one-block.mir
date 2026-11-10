@@ -7,7 +7,11 @@
 # land in the same block for the same register, and both have to be charged:
 # the cost model once keyed them as one. A copy of a 128-bit register in a loop
 # block costs 576.
+#
+# %x is restored, so it stays VGPR and the AGPR the MFMAs write is counted next
+# to it: the ArchVGPR pressure does not drop, and the AGPR pressure rises.
 
+# CHECK: region 1: ArchVGPR 295 -> 295, AGPR 0 -> 4
 # CHECK: copy cost 1152
 
 --- |

@@ -67,6 +67,10 @@ private:
     SmallSetVector<Register, 16> RecolorRegs;
     /// (reaching def, register) pairs that get one bridge copy each.
     SmallSetVector<std::pair<MachineInstr *, Register>, 16> DefBridges;
+    /// Registers whose MFMA result is copied back into the original after the
+    /// MFMA. The original stays VGPR and live, next to the AGPR the MFMA
+    /// writes.
+    SmallSetVector<Register, 16> RestoredRegs;
     /// One (block, register) pair per AGPR->VGPR copy or restore that apply()
     /// emits, so the same pair can appear more than once.
     SmallVector<std::pair<MachineBasicBlock *, Register>, 16> UseBridges;
@@ -87,9 +91,17 @@ private:
   /// or 0 if converting none of them is.
   unsigned findBestChainCount(ArrayRef<SmallVector<MachineInstr *, 8>> Chains);
 
-  /// \returns the pressure of every region over the ArchVGPR limit, as it would
-  /// be once \p Plan is applied. The AGPR form is reverted before returning.
+  /// \returns the pressure of every region, as it would be once \p Plan is
+  /// applied. The AGPR form is reverted before returning.
+  ///
+  /// A register that is restored after its MFMA stays VGPR here, and the AGPR
+  /// the MFMA writes is counted wherever an MFMA uses it. Any other register
+  /// is counted in the AGPR bank alone: what is left of it in VGPR is a copy
+  /// that lives for a use or two.
   SmallVector<GCNRegPressure, 8> measure(const MFMARewritePlan &Plan);
+
+  /// \returns the pressure \p Reg would have as an AGPR.
+  GCNRegPressure agprPressureOf(Register Reg);
 
   /// What cost() thinks of a plan. Compared by findBestChainCount(); see
   /// isBetterThan() for the ordering.

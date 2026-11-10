@@ -319,6 +319,7 @@ bool RewriteMFMAFormStage::buildPlan(MFMARewritePlan &Plan,
         !Entry.DstRecolorSafe && (DstUses.empty() || HasTiedUse);
     if (Entry.DstNeedsRestore) {
       Plan.UseBridges.push_back({MI->getParent(), DstReg});
+      Plan.RestoredRegs.insert(DstReg);
       Plan.Entries.push_back(std::move(Entry));
       RedefRegs.insert(DstReg);
       continue;
@@ -389,18 +390,55 @@ bool RewriteMFMAFormStage::buildPlan(MFMARewritePlan &Plan,
 
 SmallVector<GCNRegPressure, 8>
 RewriteMFMAFormStage::measure(const MFMARewritePlan &Plan) {
+  // A restored register keeps its VGPR value next to the AGPR the MFMA writes.
+  // Flipping it here would count it in one bank only.
+  SmallVector<Register, 16> Recolor;
+  for (Register Reg : Plan.RecolorRegs)
+    if (!Plan.RestoredRegs.contains(Reg))
+      Recolor.push_back(Reg);
+
   // Put the candidates in AGPR form just long enough to measure the pressure
   // they produce. The scope restores the VGPR form on every exit path: the real
   // rewrite has to happen after copy insertion, since some defs of a register
   // may still require a VGPR.
-  AMDGPU::MFMAToAGPR::FormScope Scope(*MFMAToAGPR, Plan.MFMAs,
-                                      Plan.RecolorRegs.getArrayRef());
+  AMDGPU::MFMAToAGPR::FormScope Scope(*MFMAToAGPR, Plan.MFMAs, Recolor);
 
   SmallVector<GCNRegPressure, 8> Pressures;
-  for (unsigned Region = 0; Region < DAG.Regions.size(); Region++)
-    if (RegionsWithExcessArchVGPR[Region])
-      Pressures.push_back(DAG.getRealRegPressure(Region));
+  for (unsigned Region = 0; Region < DAG.Regions.size(); Region++) {
+    GCNRegPressure Pressure = DAG.getRealRegPressure(Region);
+
+    // The AGPR an MFMA writes for a restored register is live next to the
+    // original wherever an MFMA uses it.
+    SmallDenseSet<Register, 4> Counted;
+    auto [Begin, End] = DAG.Regions[Region];
+    for (MachineInstr &MI : make_range(Begin, End)) {
+      if (!Plan.MFMASet.contains(&MI))
+        continue;
+      for (const MachineOperand &MO : MI.explicit_uses()) {
+        Register Reg = MO.isReg() ? MO.getReg() : Register();
+        if (!Plan.RestoredRegs.contains(Reg) || !Counted.insert(Reg).second)
+          continue;
+        Pressure += agprPressureOf(Reg);
+      }
+      Register Dst = MI.getOperand(0).getReg();
+      if (Plan.RestoredRegs.contains(Dst) && Counted.insert(Dst).second)
+        Pressure += agprPressureOf(Dst);
+    }
+    Pressures.push_back(Pressure);
+  }
   return Pressures;
+}
+
+GCNRegPressure RewriteMFMAFormStage::agprPressureOf(Register Reg) {
+  // Measure Reg as if it were an AGPR, without creating a register to do it:
+  // that would shift the numbers of the registers apply() creates.
+  const TargetRegisterClass *RC = DAG.MRI.getRegClass(Reg);
+  DAG.MRI.setRegClass(Reg, SRI->getEquivalentAGPRClass(RC));
+  GCNRegPressure P;
+  P.inc(Reg, LaneBitmask::getNone(), DAG.MRI.getMaxLaneMaskForVReg(Reg),
+        DAG.MRI);
+  DAG.MRI.setRegClass(Reg, RC);
+  return P;
 }
 
 RewriteMFMAFormStage::MFMARewriteCost
@@ -419,11 +457,7 @@ RewriteMFMAFormStage::cost(const MFMARewritePlan &Plan,
   unsigned AGPRThreshold = MaxVectorRegs.second;
   unsigned CombinedThreshold = ST.getMaxNumVGPRs(MF);
 
-  unsigned MeasuredIdx = 0;
   for (unsigned Region = 0; Region < DAG.Regions.size(); Region++) {
-    if (!RegionsWithExcessArchVGPR[Region])
-      continue;
-
     GCNRegPressure &PressureBefore = DAG.Pressure[Region];
     unsigned SpillCostBefore = PressureBefore.getVGPRSpills(
         MF, ArchVGPRThreshold, AGPRThreshold, CombinedThreshold);
@@ -432,17 +466,20 @@ RewriteMFMAFormStage::cost(const MFMARewritePlan &Plan,
     // addressable limit), rewriting alone should bring pressure to manageable
     // level. If we find any such region, then the rewrite is potentially
     // beneficial.
-    GCNRegPressure PressureAfter = PressuresAfter[MeasuredIdx++];
+    GCNRegPressure PressureAfter = PressuresAfter[Region];
     unsigned SpillCostAfter = PressureAfter.getVGPRSpills(
         MF, ArchVGPRThreshold, AGPRThreshold, CombinedThreshold);
     MaxAGPRAfter = std::max(MaxAGPRAfter, PressureAfter.getAGPRNum());
 
-    LLVM_DEBUG(dbgs() << "  region " << Region << ": ArchVGPR "
-                      << PressureBefore.getArchVGPRNum() << " -> "
-                      << PressureAfter.getArchVGPRNum() << ", AGPR "
-                      << PressureBefore.getAGPRNum() << " -> "
-                      << PressureAfter.getAGPRNum() << ", spills "
-                      << SpillCostBefore << " -> " << SpillCostAfter << '\n');
+    LLVM_DEBUG({
+      if (RegionsWithExcessArchVGPR[Region] || PressureBefore != PressureAfter)
+        dbgs() << "  region " << Region << ": ArchVGPR "
+               << PressureBefore.getArchVGPRNum() << " -> "
+               << PressureAfter.getArchVGPRNum() << ", AGPR "
+               << PressureBefore.getAGPRNum() << " -> "
+               << PressureAfter.getAGPRNum() << ", spills " << SpillCostBefore
+               << " -> " << SpillCostAfter << '\n';
+    });
 
     uint64_t BlockFreq =
         MBFI->getBlockFreq(DAG.Regions[Region].first->getParent())
